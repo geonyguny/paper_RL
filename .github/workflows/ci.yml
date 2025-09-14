@@ -9,7 +9,7 @@ on:
 
 jobs:
   test:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -24,12 +24,16 @@ jobs:
       - name: Install (minimal for smoke)
         run: |
           python -m pip install --upgrade pip
-          if exist requirements-ci.txt (pip install -r requirements-ci.txt) else (pip install -r requirements.txt)
+          if [ -f requirements-ci.txt ]; then pip install -r requirements-ci.txt; else pip install -r requirements.txt; fi
 
-      - name: Debug env
+      - name: Debug pip/env
         run: |
-          python -c "import sys,platform;print(sys.version);print(platform.platform())"
-          pip freeze
+          python -m pip debug --verbose
+          python - << 'PY'
+          import sys, platform
+          print(sys.version)
+          print(platform.platform())
+          PY
 
       - name: Sanity import
         run: |
@@ -40,8 +44,8 @@ jobs:
           PY
 
       - name: Smoke tests (skip cli_help to avoid heavy imports)
-        shell: pwsh
         run: |
-          pytest -q -k "not cli_help"
-          if (1 -eq 5) { Write-Host "No tests collected; treating as pass"; exit 0 }
-          exit 1
+          pytest -q -k "not cli_help" || EC=True
+          # pytest exit code 5 = no tests collected -> pass
+          if [ "" = "5" ]; then echo "No tests collected; treating as pass"; exit 0; fi
+          exit 
