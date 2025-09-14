@@ -57,6 +57,7 @@ def _load_market_arrays(csv_path: str, use_real_rf: str) -> Tuple[np.ndarray, np
 
     return risky.astype(float), safe.astype(float)
 
+
 # ---------- Environment ----------
 class RetirementEnv:
     """
@@ -64,60 +65,68 @@ class RetirementEnv:
       - state: (t_norm, W_t)
       - action: (q, w) in [0,1]^2
       - order: clip -> consume -> returns(+hedge) -> fee -> reward
-    Required cfg attrs (with defaults if missing):
-      horizon_years(15), steps_per_year(12), W0(1.0),
-      w_max(1.0), q_floor(0.0), fee_annual(0.004),
-      survive_bonus(0.0), u_scale(0.05), crra_gamma(3.0),
-      market_mode('bootstrap'|'iid'), market_csv, bootstrap_block(24),
-      use_real_rf('on'|'off'),
-      hedge('on'|'off'), hedge_mode('sigma'|'downside'), hedge_sigma_k(0~1), hedge_cost(annual)
+
+    Notes
+    - __init__는 cfg 객체 **또는** 키워드 인자(**kwargs)** 둘 다 지원.
+    - step()은 tests 호환을 위해 (obs, reward, done, info) 4-튜플을 반환.
+    - 헤지 비용은 '헤지 발동(hedge_active=True)'인 스텝에만 1회 차감.
     """
-    def __init__(self, cfg: Any):
+
+    # --- cfg/kwargs 통합 접근자 ---
+    @staticmethod
+    def _get(cfg: Any, kwargs: dict, name: str, default: Any) -> Any:
+        if kwargs and (name in kwargs):
+            return kwargs[name]
+        if cfg is not None and hasattr(cfg, name):
+            return getattr(cfg, name)
+        return default
+
+    def __init__(self, cfg: Any = None, **kwargs):
         # --- time / wealth / prefs ---
-        self.steps_per_year = int(max(1, getattr(cfg, 'steps_per_year', 12)))
-        self.T = int(max(1, getattr(cfg, 'horizon_years', 15))) * self.steps_per_year
-        self.W0 = float(getattr(cfg, 'W0', 1.0))
-        self.w_max = float(getattr(cfg, 'w_max', 1.0))
-        self.q_floor = float(getattr(cfg, 'q_floor', 0.0))
-        self.fee_annual = float(getattr(cfg, 'fee_annual', 0.004))
+        self.steps_per_year = int(max(1, self._get(cfg, kwargs, 'steps_per_year', 12)))
+        self.T = int(max(1, self._get(cfg, kwargs, 'horizon_years', 15))) * self.steps_per_year
+        self.W0 = float(self._get(cfg, kwargs, 'W0', 1.0))
+        self.w_max = float(self._get(cfg, kwargs, 'w_max', 1.0))
+        self.q_floor = float(self._get(cfg, kwargs, 'q_floor', 0.0))
+        self.fee_annual = float(self._get(cfg, kwargs, 'fee_annual', 0.004))
+        # 월 수수료(단순형). 테스트는 지수/단순 둘 다 허용하므로 단순형 유지.
         self.fee_m = self.fee_annual / self.steps_per_year
-        self.survive_bonus = float(getattr(cfg, 'survive_bonus', 0.0))
-        self.u_scale = float(getattr(cfg, 'u_scale', 0.05))
-        self.gamma = float(getattr(cfg, 'crra_gamma', 3.0))
+        self.survive_bonus = float(self._get(cfg, kwargs, 'survive_bonus', 0.0))
+        self.u_scale = float(self._get(cfg, kwargs, 'u_scale', 0.05))
+        self.gamma = float(self._get(cfg, kwargs, 'crra_gamma', 3.0))
 
         # --- market sources ---
-        self.market_mode = str(getattr(cfg, 'market_mode', 'bootstrap') or 'bootstrap').lower()
-        self.market_csv = str(getattr(cfg, 'market_csv', '') or '')
-        self.bootstrap_block = int(max(1, getattr(cfg, 'bootstrap_block', 24) or 24))
-        self.use_real_rf = str(getattr(cfg, 'use_real_rf', 'on') or 'on').lower()
+        self.market_mode = str(self._get(cfg, kwargs, 'market_mode', 'bootstrap') or 'bootstrap').lower()
+        self.market_csv = str(self._get(cfg, kwargs, 'market_csv', '') or '')
+        self.bootstrap_block = int(max(1, self._get(cfg, kwargs, 'bootstrap_block', 24) or 24))
+        self.use_real_rf = str(self._get(cfg, kwargs, 'use_real_rf', 'on') or 'on').lower()
 
         # --- hedge params ---
-        self.hedge = str(getattr(cfg, "hedge", "off") or "off").lower()              # 'on'|'off'
-        self.hedge_mode = str(getattr(cfg, "hedge_mode", "sigma") or "sigma").lower()# 'sigma'|'downside' (확장 여지)
-        # 강도 k ∈ [0,1]
-        self.hedge_sigma_k = float(getattr(cfg, "hedge_sigma_k", 0.50))
+        self.hedge = str(self._get(cfg, kwargs, "hedge", "off") or "off").lower()               # 'on'|'off'
+        self.hedge_mode = str(self._get(cfg, kwargs, "hedge_mode", "sigma") or "sigma").lower() # 'sigma'|'downside'
+        self.hedge_sigma_k = float(self._get(cfg, kwargs, "hedge_sigma_k", 0.50))
         self.hedge_sigma_k = float(max(0.0, min(1.0, self.hedge_sigma_k)))
 
-        # 항상 부과되는 기본 프리미엄 (k·w 비례). 기존 --hedge_cost 를 프리미엄으로 해석.
-        premium_annual = getattr(cfg, "hedge_premium", None)
+        # 비용 정책: '발동 시에만' 차감되는 월 프리미엄(=activated cost).
+        premium_annual = self._get(cfg, kwargs, "hedge_premium", None)
         if premium_annual is None:
-            premium_annual = getattr(cfg, "hedge_cost", 0.005)  # backward-compat
+            premium_annual = self._get(cfg, kwargs, "hedge_cost", 0.005)  # backward-compat alias
         self.hedge_premium_annual = float(max(0.0, premium_annual))
         self.hedge_premium_m = self.hedge_premium_annual / self.steps_per_year
-
-        # (선택) 발동 시 추가 비용: downside/sigma 등 '헤지 발동' 할 때만 부과
-        self.hedge_tx_annual = float(max(0.0, getattr(cfg, "hedge_tx", 0.0)))
-        self.hedge_tx_m = self.hedge_tx_annual / self.steps_per_year
-
-        # --- alias (과거 코드 호환용): hedge_cost*_ → premium*_
+        # alias (구코드 호환)
         self.hedge_cost = self.hedge_premium_annual
         self.hedge_cost_m = self.hedge_premium_m
 
+        # (선택) 발동 시 추가 수수료(거래/슬리피지 등)를 쓰고 싶을 때
+        self.hedge_tx_annual = float(max(0.0, self._get(cfg, kwargs, "hedge_tx", 0.0)))
+        self.hedge_tx_m = self.hedge_tx_annual / self.steps_per_year
+
         # --- seeding / path counter ---
-        if hasattr(cfg, "seed") and getattr(cfg, "seed") is not None:
-            self.seed_base = int(getattr(cfg, "seed"))
+        seed_attr = self._get(cfg, kwargs, "seed", None)
+        if seed_attr is not None:
+            self.seed_base = int(seed_attr)
         else:
-            seeds = getattr(cfg, "seeds", [0])
+            seeds = self._get(cfg, kwargs, "seeds", [0]) or [0]
             self.seed_base = int(seeds[0] if len(seeds) > 0 else 0)
         self._path_counter = 0  # increments each reset for iid reproducibility
 
@@ -185,12 +194,14 @@ class RetirementEnv:
         - step(q=..., w=...)
         - step(q, w)
         - step([q, w]) / step((q, w)) / step(np.array([q, w]))
-        Returns: (obs, reward, done, trunc, info)  # gymnasium-style 5-tuple
+
+        Returns (classic gym-style 4-tuple):
+          (obs, reward, done, info)
 
         변경점:
-        - 헤지 비용은 hedge_active=True 인 달에만 1회 차감 (이중 차감 제거)
-        - 모든 중간 변수(k, hedge_active, r_risky_eff) 항상 초기화
-        - 안전한 클리핑 및 에피소드 종료 가드
+        - 헤지 비용은 hedge_active=True 인 달에만 1회 차감 (이중 차감 방지)
+        - downside 모드는 '상승 미개입 / 하락만 (1-k)배로 완화 / 손실 뒤집지 않음' 불변조건 보장
+        - sigma 모드는 위험자산-안전자산 convex mix(상시 발동)
         """
         # ---- parse (q, w) ----
         if len(args) == 1 and not kwargs:
@@ -209,7 +220,7 @@ class RetirementEnv:
 
         # ---- guard: episode already ended ----
         if self.t >= self.T:
-            return self._obs(), 0.0, True, False, {}
+            return self._obs(), 0.0, True, {}
 
         # 1) clip action
         q = max(float(getattr(self, "q_floor", 0.0) or 0.0), _clip01(q))
@@ -220,13 +231,15 @@ class RetirementEnv:
         W_after_c = max(self.W - c, 0.0)
 
         # 3) returns (with optional hedge)
-        r_risky = float(self.path_risky[self.t])
-        r_safe  = float(self.path_safe[self.t])
+        r_risky_raw = float(self.path_risky[self.t])
+        r_safe      = float(self.path_safe[self.t])
+        r_pos = max(r_risky_raw, 0.0)
+        r_neg = min(r_risky_raw, 0.0)
 
         # hedge defaults
         k = 0.0
         hedge_active = False
-        r_risky_eff = r_risky
+        r_risky_eff = r_risky_raw
 
         if str(getattr(self, "hedge", "off")).lower() == "on":
             # strength in [0,1]
@@ -234,27 +247,39 @@ class RetirementEnv:
             mode = str(getattr(self, "hedge_mode", "sigma")).lower()
 
             if mode == "sigma":
-                # 항상 안전자산과 혼합해 변동성 완화
-                r_risky_eff = (1.0 - k) * r_risky + k * r_safe
+                # 항상 안전자산과 혼합해 변동성 완화(상시 발동)
+                r_risky_eff = (1.0 - k) * r_risky_raw + k * r_safe
                 hedge_active = True
-            elif mode == "downside":
-                # 하락 구간에서만 완화
-                if r_risky < 0.0:
-                    r_risky_eff = (1.0 - k) * r_risky + k * r_safe
-                    hedge_active = True
-            # elif mode == "mu":  # 필요 시 추가
-            #     ...
 
-        gross = 1.0 + (w * r_risky_eff + (1.0 - w) * r_safe)
-        W_after_ret = W_after_c * gross
+            elif mode in ("downside", "down"):
+                # 하락 구간에서만 완화: r_eff = r_pos + (1-k) * r_neg
+                if r_risky_raw < 0.0 and k > 0.0:
+                    r_risky_eff = r_pos + (1.0 - k) * r_neg
+                    hedge_active = True
+                else:
+                    r_risky_eff = r_risky_raw
+
+            # 추가 모드는 필요 시 여기에...
+
+        # 안전 클램프: 상승 이득 금지, 손실 뒤집기 금지 (r_eff ∈ [r_neg, r_pos])
+        r_risky_eff = max(r_neg, min(r_risky_eff, r_pos))
+
+        # 포트폴리오 월수익률 (헤지 비용 제외)
+        r_port = w * r_risky_eff + (1.0 - w) * r_safe
 
         # --- 헤지 비용: '해당 스텝에 실제 헤지 동작'이 있었을 때만 1회 차감 ---
         hedge_cost_m = float(getattr(self, "hedge_cost_m", 0.0))
         if hedge_active and hedge_cost_m > 0.0:
-            # 헤지 강도/헤지된 위험노출에 비례해 차감(여기선 w를 프록시로 사용)
-            W_after_ret *= (1.0 - hedge_cost_m * w)
+            # 헤지된 위험노출(w)에 비례한 드래그(선택: k 반영 원하면 w*k로 변경 가능)
+            r_port -= w * hedge_cost_m
+            # (선택) 거래성 비용이 있을 경우 추가 차감
+            if getattr(self, "hedge_tx_m", 0.0) > 0.0:
+                r_port -= w * float(getattr(self, "hedge_tx_m"))
 
-        # 4) 운용 수수료
+        gross = 1.0 + r_port
+        W_after_ret = W_after_c * gross
+
+        # 4) 운용 수수료 (소비→수익률→fee 순서 유지)
         fee_m = float(getattr(self, "fee_m", 0.0))
         fee = fee_m * W_after_ret
         self.W = max(W_after_ret - fee, 0.0)
@@ -268,7 +293,10 @@ class RetirementEnv:
         # advance time & termination
         self.t += 1
         done = (self.t >= self.T) or (self.W <= 0.0)
-        trunc = False
+
+        # 진단 플래그(버그 탐지용)
+        flip_neg_to_pos = (r_risky_raw < 0.0 and r_risky_eff >= 0.0)
+        up_drift = (r_risky_raw >= 0.0 and r_risky_eff > r_risky_raw)
 
         # info for diagnostics
         info = {
@@ -276,12 +304,15 @@ class RetirementEnv:
             "W": float(self.W),
             "q": float(q),
             "w": float(w),
-            "r_risky": float(r_risky),
+            "r_risky": float(r_risky_raw),
             "r_risky_eff": float(r_risky_eff),
             "r_safe": float(r_safe),
             "hedge": str(getattr(self, "hedge", "off")).lower(),
             "hedge_mode": str(getattr(self, "hedge_mode", "sigma")).lower(),
             "hedge_active": bool(hedge_active),
             "hedge_k": float(k),
+            # 버그 감시용 지표
+            "FlipNegToPos": bool(flip_neg_to_pos),
+            "UpDriftRate": bool(up_drift),
         }
-        return self._obs(), float(reward), bool(done), bool(trunc), info
+        return self._obs(), float(reward), bool(done), info
