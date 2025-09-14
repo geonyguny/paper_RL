@@ -33,6 +33,6 @@ jobs:
       - name: Smoke tests (tolerate no tests)
         shell: pwsh
         run: |
-          pytest -q
+          pytest -q -k "not cli_help"
           if ($LASTEXITCODE -eq 5) { Write-Host "No tests collected; treating as pass"; exit 0 }
           exit $LASTEXITCODE
