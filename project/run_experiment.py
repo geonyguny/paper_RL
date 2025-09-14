@@ -8,6 +8,14 @@ from .env import RetirementEnv
 from .hjb import HJBSolver
 from .eval import evaluate
 
+# --- FAST HELP PATH FOR CI/SMOKE ---
+import sys
+if any(x in sys.argv for x in ("-h", "--help")):
+    import argparse
+    argparse.ArgumentParser(add_help=True, description="Run experiments").print_help()
+    raise SystemExit(0)
+# --- END FAST HELP PATH ---
+
 # (optional) autosave (eval.py에 구현되어 있으면 사용)
 try:
     from .eval import save_metrics_autocsv, plot_frontier_from_csv  # noqa

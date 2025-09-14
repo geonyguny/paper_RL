@@ -48,7 +48,7 @@ jobs:
 
       - name: Smoke tests (skip cli_help to avoid heavy imports)
         run: |
-          pytest -q -k "not cli_help" || EC=True
+          pytest -q || EC=True
           # pytest exit code 5 = no tests collected -> pass
           if [ "" = "5" ]; then echo "No tests collected; treating as pass"; exit 0; fi
           exit 
