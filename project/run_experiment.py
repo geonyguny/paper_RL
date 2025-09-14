@@ -82,6 +82,7 @@ def make_cfg(args) -> SimConfig:
         hedge_mode=args.hedge_mode,
         hedge_cost=args.hedge_cost,
         hedge_sigma_k=args.hedge_sigma_k,
+        hedge_tx=args.hedge_tx,  # ★ 추가
         # market realism
         market_mode=args.market_mode,
         market_csv=args.market_csv,
@@ -309,7 +310,7 @@ def slim_args(args) -> dict:
         "w_fixed", "floor_on", "f_min_real", "es_mode", "outputs",
         "hjb_W_grid", "hjb_Nshock", "hjb_eta_n",
         # hedge
-        "hedge", "hedge_mode", "hedge_cost", "hedge_sigma_k",
+        "hedge", "hedge_mode", "hedge_cost", "hedge_sigma_k", "hedge_tx",
         # market
         "market_mode", "market_csv", "bootstrap_block", "use_real_rf",
         # mortality
@@ -574,6 +575,7 @@ def main():
     p.add_argument("--hedge_mode", choices=["mu", "sigma", "downside"], default="sigma")
     p.add_argument("--hedge_cost", type=float, default=0.005)
     p.add_argument("--hedge_sigma_k", type=float, default=0.20)
+    p.add_argument("--hedge_tx", type=float, default=0.0)  # ★ 추가: 발동시 추가비용(연)
 
     # === Market realism ===
     p.add_argument("--market_mode", choices=["iid", "bootstrap"], default="iid")
