@@ -74,39 +74,64 @@ class RetirementEnv:
     """
     def __init__(self, cfg: Any):
         # --- time / wealth / prefs ---
-        self.steps_per_year = int(getattr(cfg, 'steps_per_year', 12))
-        self.T = int(getattr(cfg, 'horizon_years', 15) * self.steps_per_year)
+        self.steps_per_year = int(max(1, getattr(cfg, 'steps_per_year', 12)))
+        self.T = int(max(1, getattr(cfg, 'horizon_years', 15))) * self.steps_per_year
         self.W0 = float(getattr(cfg, 'W0', 1.0))
         self.w_max = float(getattr(cfg, 'w_max', 1.0))
         self.q_floor = float(getattr(cfg, 'q_floor', 0.0))
         self.fee_annual = float(getattr(cfg, 'fee_annual', 0.004))
-        self.fee_m = self.fee_annual / max(self.steps_per_year, 1)
+        self.fee_m = self.fee_annual / self.steps_per_year
         self.survive_bonus = float(getattr(cfg, 'survive_bonus', 0.0))
         self.u_scale = float(getattr(cfg, 'u_scale', 0.05))
         self.gamma = float(getattr(cfg, 'crra_gamma', 3.0))
 
         # --- market sources ---
-        self.market_mode = str(getattr(cfg, 'market_mode', 'bootstrap')).lower()
-        self.market_csv = str(getattr(cfg, 'market_csv', ''))
-        self.bootstrap_block = int(getattr(cfg, 'bootstrap_block', 24))
-        self.use_real_rf = str(getattr(cfg, 'use_real_rf', 'on'))
+        self.market_mode = str(getattr(cfg, 'market_mode', 'bootstrap') or 'bootstrap').lower()
+        self.market_csv = str(getattr(cfg, 'market_csv', '') or '')
+        self.bootstrap_block = int(max(1, getattr(cfg, 'bootstrap_block', 24) or 24))
+        self.use_real_rf = str(getattr(cfg, 'use_real_rf', 'on') or 'on').lower()
 
         # --- hedge params ---
-        self.hedge = str(getattr(cfg, "hedge", "off")).lower()              # 'on'|'off'
-        self.hedge_mode = str(getattr(cfg, "hedge_mode", "sigma")).lower()  # 'sigma'|'downside'
-        self.hedge_sigma_k = float(getattr(cfg, "hedge_sigma_k", 0.50))     # 0~1
-        self.hedge_cost = float(getattr(cfg, "hedge_cost", 0.005))          # annual
-        self.hedge_cost_m = self.hedge_cost / max(self.steps_per_year, 1)   # monthly
+        self.hedge = str(getattr(cfg, "hedge", "off") or "off").lower()              # 'on'|'off'
+        self.hedge_mode = str(getattr(cfg, "hedge_mode", "sigma") or "sigma").lower()# 'sigma'|'downside' (확장 여지)
+        # 강도 k ∈ [0,1]
+        self.hedge_sigma_k = float(getattr(cfg, "hedge_sigma_k", 0.50))
+        self.hedge_sigma_k = float(max(0.0, min(1.0, self.hedge_sigma_k)))
+
+        # 항상 부과되는 기본 프리미엄 (k·w 비례). 기존 --hedge_cost 를 프리미엄으로 해석.
+        premium_annual = getattr(cfg, "hedge_premium", None)
+        if premium_annual is None:
+            premium_annual = getattr(cfg, "hedge_cost", 0.005)  # backward-compat
+        self.hedge_premium_annual = float(max(0.0, premium_annual))
+        self.hedge_premium_m = self.hedge_premium_annual / self.steps_per_year
+
+        # (선택) 발동 시 추가 비용: downside/sigma 등 '헤지 발동' 할 때만 부과
+        self.hedge_tx_annual = float(max(0.0, getattr(cfg, "hedge_tx", 0.0)))
+        self.hedge_tx_m = self.hedge_tx_annual / self.steps_per_year
+
+        # --- alias (과거 코드 호환용): hedge_cost*_ → premium*_
+        self.hedge_cost = self.hedge_premium_annual
+        self.hedge_cost_m = self.hedge_premium_m
 
         # --- seeding / path counter ---
-        self.seed_base = int(getattr(cfg, "seed", None) or (getattr(cfg, "seeds", [0])[0] if hasattr(cfg, "seeds") else 0))
+        if hasattr(cfg, "seed") and getattr(cfg, "seed") is not None:
+            self.seed_base = int(getattr(cfg, "seed"))
+        else:
+            seeds = getattr(cfg, "seeds", [0])
+            self.seed_base = int(seeds[0] if len(seeds) > 0 else 0)
         self._path_counter = 0  # increments each reset for iid reproducibility
 
         # --- preload market arrays if bootstrap ---
-        if self.market_mode == 'bootstrap' and os.path.exists(self.market_csv):
-            self._risky, self._safe = _load_market_arrays(self.market_csv, self.use_real_rf)
-        else:
-            # iid fallback distribution (realistic-ish monthly)
+        try:
+            if self.market_mode == 'bootstrap' and os.path.exists(self.market_csv):
+                self._risky, self._safe = _load_market_arrays(self.market_csv, self.use_real_rf)
+            else:
+                # iid fallback distribution (realistic-ish monthly)
+                rng = np.random.default_rng(7)
+                self._risky = rng.normal(0.06/12, 0.18/np.sqrt(12), size=6000)
+                self._safe  = np.full(6000, 0.02/12)
+        except Exception:
+            # 안전한 최종 fallback
             rng = np.random.default_rng(7)
             self._risky = rng.normal(0.06/12, 0.18/np.sqrt(12), size=6000)
             self._safe  = np.full(6000, 0.02/12)
