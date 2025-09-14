@@ -1,0 +1,22 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+
+# IDE/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Project outputs & large artifacts
+outputs/
+*_logs/
+*.png
+*.csv
+
+# Market data (keep sample)
+project/data/market/*.csv
+!project/data/market/sample_market_600m.csv
