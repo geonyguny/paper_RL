@@ -10,6 +10,10 @@ from .eval import evaluate
 
 # --- FAST HELP PATH FOR CI/SMOKE ---
 import sys
+from .policy.kgr_rule import (
+    KGRLiteConfig, KGRLiteState,
+    kgr_lite_init, kgr_lite_update_yearly, kgr_lite_policy_step
+)
 if any(x in sys.argv for x in ("-h", "--help")):
     import argparse
     argparse.ArgumentParser(add_help=True, description="Run experiments").print_help()
@@ -232,6 +236,117 @@ def build_actor(cfg: SimConfig, args):
                 return q_m, w
 
             return actor
+        
+        elif cfg.baseline == "kgr":
+            # --- K-GR Lite: 생명표/실질 rf/수수료 내재 + 연 1회 FR 가드레일, w는 고정 ---
+            # env에서 초기값/메타를 최대한 가져오고, 없으면 보수적 기본값 사용
+            steps_per_year = int(getattr(cfg, "steps_per_year", 12) or 12)
+            q_floor = float(getattr(cfg, "q_floor", 0.02) or 0.02)
+            fee_annual = float(getattr(cfg, "phi_adval", getattr(cfg, "fee_annual", 0.004)) or 0.004)
+            w_fixed = float(getattr(cfg, "w_fixed", None) if getattr(cfg, "w_fixed", None) is not None else cfg.w_max)
+
+            # life table / real rf (있으면 활용)
+            life_table_df = getattr(env, "life_table", None)
+            if life_table_df is None:
+                life_table_df = getattr(env, "mort_table_df", None)
+            r_f_real_annual = float(getattr(env, "r_f_real_annual", 0.02) or 0.02)
+
+            # 초기 자산/나이
+            W0 = float(getattr(env, "W0", 1.0))
+            age0 = float(getattr(cfg, "age0", 65) or 65)
+
+            # KGR 설정 & 상태 초기화
+            kgr_cfg = KGRLiteConfig(
+                FR_high=1.30, FR_low=0.85,
+                delta_up=0.07, delta_dn=-0.07,
+                kappa_safety=0.002,
+                w_fixed=w_fixed,
+                q_floor=q_floor,
+                phi_adval_annual=fee_annual,
+                steps_per_year=steps_per_year,
+            )
+            # life_table이 없으면 연금계수 업데이트가 불가 → q0는 실행시 obs로 lazy-init
+            kgr_state = None
+            if life_table_df is not None:
+                kgr_state = kgr_lite_init(
+                    W0=W0, age0=age0,
+                    life_table=life_table_df,
+                    r_f_real_annual=r_f_real_annual,
+                    cfg=kgr_cfg,
+                )
+
+            # --- actor 정의 ---
+            def actor(obs):
+                """
+                obs는 dict 또는 numpy 배열일 수 있음.
+                - dict일 때 우선: 'W_t','age_years','cpi_yoy','is_new_year' 키 사용
+                - 배열/None일 때: 가능한 범위에서 보수적 기본 처리
+                """
+                nonlocal kgr_state
+
+                # 관측 파싱
+                W_t = None; age_years = None; cpi_yoy = 0.0; is_new_year = False
+                if isinstance(obs, dict):
+                    W_t = float(obs.get("W_t", getattr(env, "W", W0)))
+                    age_years = float(obs.get("age_years", getattr(env, "age_years", age0)))
+                    cpi_yoy = float(obs.get("cpi_yoy", 0.0))
+                    is_new_year = bool(obs.get("is_new_year", False))
+                    # obs가 life_table/rf를 넘겨주면 그 값 사용
+                    lt_in = obs.get("life_table", None)
+                    rf_in = obs.get("r_f_real_annual", None)
+                else:
+                    # HJB 경로처럼 배열일 수 있음: env에서 최대한 가져오기
+                    W_t = float(getattr(env, "W", W0))
+                    age_years = float(getattr(env, "age_years", age0))
+                    lt_in = None; rf_in = None
+
+                # lazy-init (life_table 없던 케이스에서 obs로 들어오면 초기화)
+                if kgr_state is None and life_table_df is not None:
+                    kgr_state = kgr_lite_init(
+                        W0=float(W_t), age0=float(age_years),
+                        life_table=life_table_df,
+                        r_f_real_annual=r_f_real_annual,
+                        cfg=kgr_cfg,
+                    )
+
+                # 연초 가드레일 업데이트
+                if kgr_state is not None and is_new_year:
+                    lt_use = life_table_df
+                    rf_use = r_f_real_annual
+                    if lt_in is not None:
+                        lt_use = lt_in
+                    if isinstance(rf_in, (int, float)):
+                        rf_use = float(rf_in)
+                    if lt_use is not None:
+                        kgr_lite_update_yearly(
+                            W_t=float(W_t),
+                            age_years=float(age_years),
+                            CPI_yoy=float(cpi_yoy),
+                            life_table=lt_use,
+                            r_f_real_annual=float(rf_use),
+                            state=kgr_state,
+                            cfg=kgr_cfg,
+                        )
+                    else:
+                        # life_table이 없으면 CPI 인상만 반영
+                        kgr_state.B = float(kgr_state.B * (1.0 + float(cpi_yoy)))
+                        kgr_state.age_years = float(age_years)
+
+                # 정책 출력 (연 기준 q_t 산출 → 월 환산)
+                if kgr_state is not None and isinstance(obs, dict):
+                    out = kgr_lite_policy_step(obs, kgr_state, kgr_cfg)
+                    q_annual = float(out["q_t"])
+                else:
+                    # 아주 보수적 fallback: 4% 룰과 동일한 월환산 (life_table 미제공 시)
+                    q_annual = max(q_floor, 0.04)
+
+                # 연→월 환산: q_m = 1 - (1 - q)^(1/steps)
+                q_m = 1.0 - (1.0 - float(q_annual)) ** (1.0 / steps_per_year)
+                q_m = float(_np.clip(q_m, q_floor, 1.0))
+                w = float(_np.clip(kgr_cfg.w_fixed, 0.0, cfg.w_max))
+                return q_m, w
+
+            return actor
 
         else:
             raise SystemExit("--baseline required for method=rule (4pct|cpb|vpw)")
@@ -308,7 +423,7 @@ def ensure_dir(path: str):
 
 
 def now_iso() -> str:
-    return datetime.datetime.now().isoformat(timespec="seconds")
+    return datetime.datetime.now().isoformatvpw(timespec="seconds")
 
 
 def slim_args(args) -> dict:
