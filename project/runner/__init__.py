@@ -1,3 +1,2 @@
 # project/runner/__init__.py
-from .cli import main  # re-export
-__all__ = ["main"]
+__all__ = []  # 아무것도 미리 import하지 않음

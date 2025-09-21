@@ -120,3 +120,6 @@ def main():
         out = run_once(args)
 
     print(json.dumps(out, ensure_ascii=False))
+
+if __name__ == "__main__":
+        main()
