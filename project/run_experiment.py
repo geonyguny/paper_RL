@@ -1,5 +1,8 @@
-﻿import argparse, json, os, hashlib, sys, csv, datetime
+﻿import argparse, json, os, hashlib, sys, csv, datetime, io, re
 import numpy as _np
+import pandas as pd
+from typing import Optional
+import contextlib, builtins as _builtins
 from .config import (
     SimConfig, ASSET_PRESETS,
     CVAR_TARGET_DEFAULT, CVAR_TOL_DEFAULT, LAMBDA_MIN_DEFAULT, LAMBDA_MAX_DEFAULT, LAMBDA_MAX_ITER
@@ -7,20 +10,18 @@ from .config import (
 from .env import RetirementEnv
 from .hjb import HJBSolver
 from .eval import evaluate
-
-# --- FAST HELP PATH FOR CI/SMOKE ---
-import sys
 from .policy.kgr_rule import (
     KGRLiteConfig, KGRLiteState,
-    kgr_lite_init, kgr_lite_update_yearly, kgr_lite_policy_step
+    kgr_lite_init, kgr_lite_update_yearly, kgr_lite_policy_step,
 )
+
+# --- FAST HELP PATH FOR CI/SMOKE ---
 if any(x in sys.argv for x in ("-h", "--help")):
-    import argparse
     argparse.ArgumentParser(add_help=True, description="Run experiments").print_help()
     raise SystemExit(0)
 # --- END FAST HELP PATH ---
 
-# (optional) autosave (eval.py에 구현되어 있으면 사용)
+# (optional) autosave
 try:
     from .eval import save_metrics_autocsv, plot_frontier_from_csv  # noqa
     _HAS_AUTOSAVE = True
@@ -34,25 +35,99 @@ except Exception:
     pass
 
 
+# -------------------- LOG FILTERS --------------------
+class _DevNull:
+    """모든 출력을 버리는 writer (빈 줄 포함 아무 것도 안 찍힘)."""
+    def __init__(self): self.encoding = "utf-8"
+    def write(self, s): return len(s)
+    def flush(self): pass
+    def isatty(self): return False
+
+@contextlib.contextmanager
+def _silence_stdio(also_stderr=True):
+    """stdout/stderr 완전 무음 컨텍스트(빈 줄 포함 전부 제거)."""
+    saved_out, saved_err = sys.stdout, sys.stderr
+    try:
+        sys.stdout = _DevNull()
+        if also_stderr:
+            sys.stderr = _DevNull()
+        yield
+    finally:
+        sys.stdout = saved_out
+        if also_stderr:
+            sys.stderr = saved_err
+
+class _LineFilterWriter:
+    """완결된 라인에서 특정 패턴이 들어간 줄만 억제(부분 무음용)."""
+    def __init__(self, underlying, patterns):
+        self._u = underlying
+        self._buf = io.StringIO()
+        self._pat = tuple(patterns)
+    def write(self, s):
+        self._buf.write(s)
+        text = self._buf.getvalue()
+        if "\n" not in text:
+            return len(s)
+        lines = text.splitlines(keepends=True)
+        if not text.endswith("\n"):
+            self._buf = io.StringIO(); self._buf.write(lines[-1]); lines = lines[:-1]
+        else:
+            self._buf = io.StringIO()
+        kept = []
+        for ln in lines:
+            if any(p in ln for p in self._pat):
+                continue
+            kept.append(ln)
+        if kept: self._u.write("".join(kept))
+        return len(s)
+    def flush(self):
+        tail = self._buf.getvalue()
+        if tail and not any(p in tail for p in self._pat):
+            self._u.write(tail)
+        self._u.flush()
+
+@contextlib.contextmanager
+def _mute_logs(patterns=("[kgr:year]",), enabled=True, streams=("stdout", "stderr")):
+    """특정 패턴 라인만 억제(quiet=off일 때 kgr만 잠깐 막고 싶을 때)."""
+    if not enabled:
+        yield; return
+    saved = {}
+    try:
+        if "stdout" in streams:
+            saved["stdout"] = sys.stdout
+            sys.stdout = _LineFilterWriter(sys.stdout, patterns)
+        if "stderr" in streams:
+            saved["stderr"] = sys.stderr
+            sys.stderr = _LineFilterWriter(sys.stderr, patterns)
+        yield
+    finally:
+        if "stdout" in saved:
+            try: sys.stdout.flush()
+            except Exception: pass
+            sys.stdout = saved["stdout"]
+        if "stderr" in saved:
+            try: sys.stderr.flush()
+            except Exception: pass
+            sys.stderr = saved["stderr"]
+
+def _mute_kgr_year_logs_if(*, no_life_table: bool):
+    """life_table 없을 때만 [kgr:year] 라인 억제(quiet=off 모드 보조)."""
+    return _mute_logs(patterns=("[kgr:year]",), enabled=bool(no_life_table))
+
+
+# -------------------- HELPERS --------------------
 def _arrhash(a):
     if a is None:
         return "none"
     x = _np.asarray(a, dtype=_np.float32).tobytes()
     return hashlib.md5(x).hexdigest()
 
-
 def _auto_eta_grid(cfg: SimConfig, requested_n: int = None):
-    """
-    F_target 기반의 eta-grid 자동 생성:
-      - lambda_term <= 0: eta-grid = (0.0,)
-      - lambda_term > 0: eta-grid = linspace(0, F(>0이면 F, 아니면 1.0), n)
-    """
     cur = getattr(cfg, "hjb_eta_grid", ())
     if float(getattr(cfg, "lambda_term", 0.0) or 0.0) <= 0.0:
         if not cur or len(cur) <= 1:
             cfg.hjb_eta_grid = (0.0,)
         return
-
     n = int(requested_n or getattr(cfg, "hjb_eta_n", 41) or 41)
     F = float(getattr(cfg, "F_target", 0.0) or 0.0)
     F = F if F > 0.0 else 1.0
@@ -62,6 +137,15 @@ def _auto_eta_grid(cfg: SimConfig, requested_n: int = None):
         step = F / max(n - 1, 1)
         cfg.hjb_eta_grid = tuple(0.0 + i * step for i in range(n))
 
+def _get_life_table_from_env(env) -> Optional[pd.DataFrame]:
+    lt = getattr(env, "life_table", None)
+    if isinstance(lt, pd.DataFrame) and not lt.empty:
+        return lt
+    lt2 = getattr(env, "mort_table_df", None)
+    if isinstance(lt2, pd.DataFrame) and not lt2.empty:
+        return lt2
+    return None
+
 
 def make_cfg(args) -> SimConfig:
     cfg = SimConfig()
@@ -70,10 +154,8 @@ def make_cfg(args) -> SimConfig:
             setattr(cfg, k, v)
     cfg.asset = args.asset
 
-    # overrides (CLI 인자 반영)
     for k, v in dict(
         w_max=args.w_max,
-        # 수수료는 두 키 모두 세팅(모듈 간 호환)
         fee_annual=args.fee_annual,
         phi_adval=args.fee_annual,
         horizon_years=args.horizon_years,
@@ -89,41 +171,33 @@ def make_cfg(args) -> SimConfig:
         hjb_W_grid=args.hjb_W_grid,
         hjb_Nshock=args.hjb_Nshock,
         # hedge
-        hedge=args.hedge,                      # "on"/"off" (RetirementEnv가 기대)
-        hedge_on=(args.hedge == "on"),         # bool도 함께 유지(로깅 등)
+        hedge=args.hedge, hedge_on=(args.hedge == "on"),
         hedge_mode=args.hedge_mode,
         hedge_cost=args.hedge_cost,
         hedge_sigma_k=args.hedge_sigma_k,
-        hedge_tx=args.hedge_tx,  # ★ 추가
+        hedge_tx=args.hedge_tx,
         # market realism
         market_mode=args.market_mode,
         market_csv=args.market_csv,
         bootstrap_block=args.bootstrap_block,
-        use_real_rf=args.use_real_rf,          # "on"/"off" 문자열 그대로
+        use_real_rf=args.use_real_rf,
         # mortality
-        mortality=args.mortality,              # "on"/"off" 문자열
-        mortality_on=(args.mortality == "on"), # bool도 함께
+        mortality=args.mortality, mortality_on=(args.mortality == "on"),
         mort_table=args.mort_table,
-        age0=args.age0,
-        sex=args.sex,
-        bequest_kappa=args.bequest_kappa,
-        bequest_gamma=args.bequest_gamma,
+        age0=args.age0, sex=args.sex,
+        bequest_kappa=args.bequest_kappa, bequest_gamma=args.bequest_gamma,
         # RL shaping / constraints
-        rl_q_cap=args.rl_q_cap,
-        teacher_eps0=args.teacher_eps0,
-        teacher_decay=args.teacher_decay,
-        lw_scale=args.lw_scale,
-        survive_bonus=args.survive_bonus,
-        crra_gamma=args.crra_gamma,
-        u_scale=args.u_scale,
+        rl_q_cap=args.rl_q_cap, teacher_eps0=args.teacher_eps0,
+        teacher_decay=args.teacher_decay, lw_scale=args.lw_scale,
+        survive_bonus=args.survive_bonus, crra_gamma=args.crra_gamma, u_scale=args.u_scale,
         # stage-wise CVaR
         cvar_stage_on=(args.cvar_stage == "on"),
-        alpha_stage=args.alpha_stage,
-        lambda_stage=args.lambda_stage,
-        cstar_mode=args.cstar_mode,
-        cstar_m=args.cstar_m,
+        alpha_stage=args.alpha_stage, lambda_stage=args.lambda_stage,
+        cstar_mode=args.cstar_mode, cstar_m=args.cstar_m,
         # XAI toggle
         xai_on=(args.xai_on == "on"),
+        # raw
+        q_floor=args.q_floor, beta=args.beta,
     ).items():
         if v is not None:
             setattr(cfg, k, v)
@@ -134,24 +208,29 @@ def make_cfg(args) -> SimConfig:
     cfg.method = args.method
     cfg.es_mode = args.es_mode
 
-    # ==== 안정화 및 기본값 보정 ====
-    # 1) eta-grid 자동 생성
-    _auto_eta_grid(cfg, requested_n=args.hjb_eta_n)
+    # q_floor: 연 입력 → 월 바닥
+    try:
+        spm = int(getattr(cfg, "steps_per_year", 12) or 12)
+    except Exception:
+        spm = 12
+    if getattr(args, "q_floor", None) is not None:
+        q_floor_ann = float(args.q_floor)
+        q_floor_m = 1.0 - (1.0 - max(min(q_floor_ann, 0.999999), 0.0)) ** (1.0 / spm)
+        setattr(cfg, "q_floor", float(q_floor_m))
+        setattr(cfg, "q_floor_annual", float(q_floor_ann))
+        # 이 안내 출력은 run_once의 quiet 컨텍스트에 의해 기본적으로 숨겨짐
+        print(f"[cfg] q_floor_annual={q_floor_ann:.6f} → q_floor_monthly={q_floor_m:.6f} (steps_per_year={spm})")
 
-    # 2) w-action 격자: config.py 자동설정 보완(없으면 8점 균등)
+    _auto_eta_grid(cfg, requested_n=args.hjb_eta_n)
     if hasattr(cfg, "hjb_w_grid") and (getattr(cfg, "hjb_w_grid", None) in (None, ())):
         n_w = 8
         cfg.hjb_w_grid = tuple(_np.round(_np.linspace(0.0, cfg.w_max, n_w), 2))
-
-    # 3) 충격 수 늘려 plateau 위험 감소
     setattr(cfg, "dev_split_w_grid", False)
     setattr(cfg, "hjb_Nshock", max(int(getattr(cfg, "hjb_Nshock", 32) or 32), 256))
-
     return cfg
 
 
 def _monthly_from_cfg(cfg):
-    """cfg.monthly()가 없을 때를 위한 월간 파라미터 폴백."""
     if hasattr(cfg, "monthly"):
         try:
             m = cfg.monthly()
@@ -187,11 +266,7 @@ def build_actor(cfg: SimConfig, args):
             return actor
 
         elif cfg.baseline == "vpw":
-            # VPW: 관측(obs)에 의존하지 않고 남은 기간만으로 q 결정
-            # - env.t / env.T 사용
-            # - g_m 계산은 cfg.monthly() 우선, 없으면 연간 성장률→월간 변환
             def _get_g_m_from_cfg(_cfg):
-                # 1) cfg.monthly()가 있으면 우선 활용
                 try:
                     if hasattr(_cfg, "monthly") and callable(_cfg.monthly):
                         m = _cfg.monthly()
@@ -201,61 +276,39 @@ def build_actor(cfg: SimConfig, args):
                                 return gm
                 except Exception:
                     pass
-                # 2) fallback: 연간 실질 성장률 -> 월간 환산
                 g_ann = float(getattr(_cfg, "g_real_annual", 0.0) or 0.0)
                 spm = int(getattr(_cfg, "steps_per_year", 12) or 12)
                 return (1.0 + g_ann)**(1.0 / spm) - 1.0
 
             def actor(_obs):
-                # 남은 월수
                 t = int(getattr(env, "t", 0))
                 T = int(getattr(env, "T", 1))
                 Nm = max(T - t, 1)
-
-                # 월간 성장률
                 g_m = _get_g_m_from_cfg(cfg)
-
-                # 등비수열 합 기반 소진률
                 if abs(g_m) < 1e-12:
                     q_m = 1.0 / Nm
                 else:
                     a = (1.0 - (1.0 + g_m) ** (-Nm)) / g_m
-                    q_m = 1.0 / max(a, 1e-12)  # 분모 안전판
-
-                # 안전한 클리핑
+                    q_m = 1.0 / max(a, 1e-12)
                 q_floor = float(getattr(cfg, "q_floor", 0.0) or 0.0)
                 q_m = float(_np.clip(q_m, q_floor, 1.0))
-
-                # 주식비중
                 w = float(cfg.w_fixed if getattr(cfg, "w_fixed", None) is not None else cfg.w_max)
-
-                # (옵션) t=0에서 q0와 파라미터 로그 찍기
-                # if t == 0:
-                #     print(f"[vpw] q0={q_m:.6f}, g_m={g_m:.8f}, T={T}, Nm={Nm}")
-
                 return q_m, w
 
             return actor
-        
+
         elif cfg.baseline == "kgr":
-            # --- K-GR Lite: 생명표/실질 rf/수수료 내재 + 연 1회 FR 가드레일, w는 고정 ---
-            # env에서 초기값/메타를 최대한 가져오고, 없으면 보수적 기본값 사용
             steps_per_year = int(getattr(cfg, "steps_per_year", 12) or 12)
             q_floor = float(getattr(cfg, "q_floor", 0.02) or 0.02)
             fee_annual = float(getattr(cfg, "phi_adval", getattr(cfg, "fee_annual", 0.004)) or 0.004)
             w_fixed = float(getattr(cfg, "w_fixed", None) if getattr(cfg, "w_fixed", None) is not None else cfg.w_max)
 
-            # life table / real rf (있으면 활용)
-            life_table_df = getattr(env, "life_table", None)
-            if life_table_df is None:
-                life_table_df = getattr(env, "mort_table_df", None)
+            life_table_df = _get_life_table_from_env(env)
             r_f_real_annual = float(getattr(env, "r_f_real_annual", 0.02) or 0.02)
 
-            # 초기 자산/나이
             W0 = float(getattr(env, "W0", 1.0))
             age0 = float(getattr(cfg, "age0", 65) or 65)
 
-            # KGR 설정 & 상태 초기화
             kgr_cfg = KGRLiteConfig(
                 FR_high=1.30, FR_low=0.85,
                 delta_up=0.07, delta_dn=-0.07,
@@ -265,99 +318,94 @@ def build_actor(cfg: SimConfig, args):
                 phi_adval_annual=fee_annual,
                 steps_per_year=steps_per_year,
             )
-            # life_table이 없으면 연금계수 업데이트가 불가 → q0는 실행시 obs로 lazy-init
             kgr_state = None
+            _kgr_once_logged = False
+
             if life_table_df is not None:
-                kgr_state = kgr_lite_init(
-                    W0=W0, age0=age0,
-                    life_table=life_table_df,
-                    r_f_real_annual=r_f_real_annual,
-                    cfg=kgr_cfg,
-                )
-
-            # --- actor 정의 ---
-            def actor(obs):
-                """
-                obs는 dict 또는 numpy 배열일 수 있음.
-                - dict일 때 우선: 'W_t','age_years','cpi_yoy','is_new_year' 키 사용
-                - 배열/None일 때: 가능한 범위에서 보수적 기본 처리
-                """
-                nonlocal kgr_state
-
-                # 관측 파싱
-                W_t = None; age_years = None; cpi_yoy = 0.0; is_new_year = False
-                if isinstance(obs, dict):
-                    W_t = float(obs.get("W_t", getattr(env, "W", W0)))
-                    age_years = float(obs.get("age_years", getattr(env, "age_years", age0)))
-                    cpi_yoy = float(obs.get("cpi_yoy", 0.0))
-                    is_new_year = bool(obs.get("is_new_year", False))
-                    # obs가 life_table/rf를 넘겨주면 그 값 사용
-                    lt_in = obs.get("life_table", None)
-                    rf_in = obs.get("r_f_real_annual", None)
-                else:
-                    # HJB 경로처럼 배열일 수 있음: env에서 최대한 가져오기
-                    W_t = float(getattr(env, "W", W0))
-                    age_years = float(getattr(env, "age_years", age0))
-                    lt_in = None; rf_in = None
-
-                # lazy-init (life_table 없던 케이스에서 obs로 들어오면 초기화)
-                if kgr_state is None and life_table_df is not None:
+                with _mute_logs(patterns=("[kgr:year]", "[kgr:init]"), enabled=(getattr(args, "quiet", "on")=="off")):
                     kgr_state = kgr_lite_init(
-                        W0=float(W_t), age0=float(age_years),
+                        W0=W0, age0=age0,
                         life_table=life_table_df,
                         r_f_real_annual=r_f_real_annual,
                         cfg=kgr_cfg,
                     )
 
-                # 연초 가드레일 업데이트
-                if kgr_state is not None and is_new_year:
-                    lt_use = life_table_df
-                    rf_use = r_f_real_annual
-                    if lt_in is not None:
-                        lt_use = lt_in
-                    if isinstance(rf_in, (int, float)):
-                        rf_use = float(rf_in)
-                    if lt_use is not None:
+            def actor(obs):
+                nonlocal kgr_state, _kgr_once_logged
+                if isinstance(obs, dict):
+                    o = dict(obs)
+                else:
+                    o = {
+                        "W_t": float(getattr(env, "W", W0)),
+                        "age_years": float(getattr(env, "age_years", age0)),
+                        "cpi_yoy": float(getattr(env, "cpi_yoy", 0.0)),
+                        "is_new_year": bool(getattr(env, "is_new_year", False)),
+                    }
+                o.setdefault("life_table", life_table_df)
+                o.setdefault("r_f_real_annual", r_f_real_annual)
+
+                if kgr_state is None:
+                    with _mute_logs(patterns=("[kgr:year]", "[kgr:init]"), enabled=(getattr(args, "quiet", "on")=="off")):
+                        kgr_state = kgr_lite_init(
+                            W0=float(o.get("W_t", W0)),
+                            age0=float(o.get("age_years", age0)),
+                            life_table=o.get("life_table", None),
+                            r_f_real_annual=float(o.get("r_f_real_annual", r_f_real_annual)),
+                            cfg=kgr_cfg,
+                        )
+
+                if bool(o.get("is_new_year", False)):
+                    no_lt = (o.get("life_table", None) is None)
+                    if not _kgr_once_logged and getattr(args, "quiet", "on")=="off":
+                        if no_lt:
+                            print("[kgr:info] life_table 없음 → CPI-only 조정(연 1회)로 동작합니다. (1회만)")
+                        else:
+                            print("[kgr:info] life_table 기반 FR 가드레일 적용. (1회만)")
+                        _kgr_once_logged = True
+
+                    with _mute_kgr_year_logs_if(no_life_table=no_lt if getattr(args, "quiet","on")=="off" else False):
                         kgr_lite_update_yearly(
-                            W_t=float(W_t),
-                            age_years=float(age_years),
-                            CPI_yoy=float(cpi_yoy),
-                            life_table=lt_use,
-                            r_f_real_annual=float(rf_use),
+                            W_t=float(o.get("W_t", W0)),
+                            age_years=float(o.get("age_years", age0)),
+                            CPI_yoy=float(o.get("cpi_yoy", 0.0)),
+                            life_table=o.get("life_table", None),
+                            r_f_real_annual=float(o.get("r_f_real_annual", r_f_real_annual)),
                             state=kgr_state,
                             cfg=kgr_cfg,
                         )
-                    else:
-                        # life_table이 없으면 CPI 인상만 반영
-                        kgr_state.B = float(kgr_state.B * (1.0 + float(cpi_yoy)))
-                        kgr_state.age_years = float(age_years)
 
-                # 정책 출력 (연 기준 q_t 산출 → 월 환산)
-                if kgr_state is not None and isinstance(obs, dict):
-                    out = kgr_lite_policy_step(obs, kgr_state, kgr_cfg)
-                    q_annual = float(out["q_t"])
+                with _mute_kgr_year_logs_if(no_life_table=(o.get("life_table", None) is None) if getattr(args,"quiet","on")=="off" else False):
+                    out = kgr_lite_policy_step(o, kgr_state, kgr_cfg)
+                q_annual = float(out.get("q_t", kgr_cfg.q_floor))
+
+                q_m = 1.0 - (1.0 - q_annual) ** (1.0 / steps_per_year)
+                q_floor_cfg = float(getattr(kgr_cfg, "q_floor", 0.02) or 0.02)
+                if bool(getattr(kgr_cfg, "q_floor_is_annual", True)):
+                    q_floor_m = 1.0 - (1.0 - q_floor_cfg) ** (1.0 / steps_per_year)
                 else:
-                    # 아주 보수적 fallback: 4% 룰과 동일한 월환산 (life_table 미제공 시)
-                    q_annual = max(q_floor, 0.04)
+                    q_floor_m = q_floor_cfg
+                q_m = float(_np.clip(q_m, q_floor_m, 1.0))
 
-                # 연→월 환산: q_m = 1 - (1 - q)^(1/steps)
-                q_m = 1.0 - (1.0 - float(q_annual)) ** (1.0 / steps_per_year)
-                q_m = float(_np.clip(q_m, q_floor, 1.0))
-                w = float(_np.clip(kgr_cfg.w_fixed, 0.0, cfg.w_max))
+                try:
+                    w_fixed_local = float(getattr(kgr_cfg, "w_fixed", 0.6))
+                except (TypeError, ValueError):
+                    w_fixed_local = 0.6
+                try:
+                    w_max = float(getattr(cfg, "w_max", 1.0))
+                except (TypeError, ValueError):
+                    w_max = 1.0
+                w = max(0.0, min(w_fixed_local, w_max))
                 return q_m, w
 
             return actor
 
         else:
-            raise SystemExit("--baseline required for method=rule (4pct|cpb|vpw)")
+            raise SystemExit("--baseline required for method=rule (4pct|cpb|vpw|kgr)")
 
     elif args.method == "hjb":
-        # ==== HJB 해 정책 생성 ====
         sol = HJBSolver(cfg).solve(seed=cfg.seeds[0])
         Pi_w = sol.get('Pi_w', None)
         Pi_q = sol.get('Pi_q', None)
-
-        # 정책 요약(진단용) + eta 출력
         print("policy_hash_q=", _arrhash(Pi_q))
         print("policy_hash_w=", _arrhash(Pi_w))
         if 'eta' in sol:
@@ -365,7 +413,6 @@ def build_actor(cfg: SimConfig, args):
                 print("eta_selected=", float(sol['eta']))
             except Exception:
                 pass
-            # 디버그 통계
             try:
                 if Pi_w is not None and Pi_q is not None and getattr(Pi_w, "size", 0) > 0 and getattr(Pi_q, "size", 0) > 0:
                     _w = _np.asarray(Pi_w); _q = _np.asarray(Pi_q)
@@ -378,14 +425,12 @@ def build_actor(cfg: SimConfig, args):
             except Exception as _e:
                 print(f"[dbg] policy stats skipped: {_e}")
 
-        # W-grid (solver 결과 없으면 기본 생성)
         if 'W_grid' in sol and sol['W_grid'] is not None:
             Wg = _np.asarray(sol['W_grid'], dtype=float)
         else:
             Wg = _np.linspace(cfg.hjb_W_min, cfg.hjb_W_max, cfg.hjb_W_grid)
 
         if Pi_w is None or getattr(Pi_w, 'size', 0) == 0 or Pi_q is None or getattr(Pi_q, 'size', 0) == 0:
-            # fallback: 상수 정책
             const_w = float(min(max(cfg.hjb_w_grid[-1], 0.0), cfg.w_max))
             q4 = 1.0 - (1.0 - 0.04) ** (1.0 / cfg.steps_per_year)
             const_q = float(q4)
@@ -393,21 +438,15 @@ def build_actor(cfg: SimConfig, args):
             return actor
 
         T_pol = int(Pi_w.shape[0])
-
-        # obs: np.array([t_normalized, W])
         def actor(obs):
-            # t 인덱스는 env.t가 신뢰도 높음
             t_idx = int(_np.clip(getattr(env, "t", 0), 0, T_pol - 1))
             W = float(obs[1])
-            # 구간 인덱스 탐색
             i = int(_np.clip(_np.searchsorted(Wg, W) - 1, 0, Wg.size - 2))
             w = float(Pi_w[t_idx, i]); q = float(Pi_q[t_idx, i])
             return q, w
-
         return actor
 
     else:
-        # legacy RL path (구버전 호환; 일반적으로 사용되지 않음)
         try:
             from .rl import A2CTrainer  # noqa
             pol = A2CTrainer(cfg).train(seed=cfg.seeds[0])
@@ -421,10 +460,8 @@ def build_actor(cfg: SimConfig, args):
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
-
 def now_iso() -> str:
-    return datetime.datetime.now().isoformatvpw(timespec="seconds")
-
+    return datetime.datetime.now().isoformat(timespec="seconds")
 
 def slim_args(args) -> dict:
     keys = [
@@ -432,23 +469,17 @@ def slim_args(args) -> dict:
         "alpha", "lambda_term", "F_target", "p_annual", "g_real_annual",
         "w_fixed", "floor_on", "f_min_real", "es_mode", "outputs",
         "hjb_W_grid", "hjb_Nshock", "hjb_eta_n",
-        # hedge
         "hedge", "hedge_mode", "hedge_cost", "hedge_sigma_k", "hedge_tx",
-        # market
         "market_mode", "market_csv", "bootstrap_block", "use_real_rf",
-        # mortality
         "mortality", "mort_table", "age0", "sex", "bequest_kappa", "bequest_gamma",
-        # stage-wise CVaR + RL shaping
         "cvar_stage", "alpha_stage", "lambda_stage", "cstar_mode", "cstar_m",
         "rl_q_cap", "teacher_eps0", "teacher_decay", "lw_scale", "survive_bonus",
         "crra_gamma", "u_scale",
-        # XAI
         "xai_on",
-        # eval
         "seeds", "n_paths",
-        # RL
         "rl_epochs", "rl_steps_per_epoch", "rl_n_paths_eval", "gae_lambda",
         "entropy_coef", "value_coef", "lr", "max_grad_norm",
+        "q_floor", "beta", "quiet",
     ]
     d = {}
     for k in keys:
@@ -456,9 +487,7 @@ def slim_args(args) -> dict:
         d[k] = v
     return d
 
-
 def append_metrics_csv(path: str, payload: dict):
-    """fallback: autosave가 없을 때 최소 CSV 기록."""
     row = {
         'ts': now_iso(),
         'asset': payload.get('asset'),
@@ -477,7 +506,6 @@ def append_metrics_csv(path: str, payload: dict):
         'horizon_years': payload.get('horizon_years'),
         'seeds': (payload.get('args') or {}).get('seeds'),
         'n_paths': (payload.get('args') or {}).get('n_paths'),
-        # extras for realism
         'mortality_on': (payload.get('args') or {}).get('mortality') == 'on',
         'market_mode': (payload.get('args') or {}).get('market_mode'),
     }
@@ -489,12 +517,16 @@ def append_metrics_csv(path: str, payload: dict):
         w.writerow(row)
 
 
-# --- 단일 실행 (HJB/Rule 공통) ---
+# --- 단일 실행 ---
 def run_once(args):
-    cfg = make_cfg(args)
-    ensure_dir(args.outputs)
-    actor = build_actor(cfg, args)
-    m = evaluate(cfg, actor, es_mode=args.es_mode)
+    # 조용 모드: 설정/정책생성/평가 전체 무음
+    quiet_ctx = _silence_stdio(also_stderr=True) if getattr(args, "quiet", "on") == "on" else contextlib.nullcontext()
+    with quiet_ctx:
+        cfg = make_cfg(args)
+        ensure_dir(args.outputs)
+        actor = build_actor(cfg, args)
+        m = evaluate(cfg, actor, es_mode=args.es_mode)
+
     out = dict(
         asset=cfg.asset, method=args.method, baseline=args.baseline, metrics=m,
         w_max=cfg.w_max, fee_annual=getattr(cfg, "phi_adval", getattr(cfg, "fee_annual", None)),
@@ -503,7 +535,6 @@ def run_once(args):
         n_paths=cfg.n_paths_eval * len(cfg.seeds),
         args=slim_args(args),
     )
-    # autosave
     if args.autosave == "on":
         try:
             if _HAS_AUTOSAVE:
@@ -554,16 +585,14 @@ def run_rl(args):
     return out
 
 
-# --- CVaR λ calibration (fast mode + early stop + final high-res) ---
+# --- CVaR λ calibration ---
 def copy_args(args, **overrides):
     from argparse import Namespace
     d = vars(args).copy()
     d.update(overrides)
     return Namespace(**d)
 
-
 def calibrate_lambda(args):
-    """Binary search on lambda_term to hit ES95(loss) <= cvar_target within cvar_tol."""
     lo, hi = float(args.lambda_min), float(args.lambda_max)
     target = float(args.cvar_target)
     tol = float(args.cvar_tol)
@@ -572,13 +601,11 @@ def calibrate_lambda(args):
 
     history = []
     cache = {}
-
     def eval_at(lmbd, fast=True):
         if (lmbd, fast) in cache:
             return cache[(lmbd, fast)]
         overrides = dict(lambda_term=float(lmbd), es_mode="loss")
         if fast and use_fast:
-            # 저해상도 + 적은 paths + 단일 seed (속도 ↑)
             overrides.update(dict(
                 hjb_W_grid=81, hjb_Nshock=128, hjb_eta_n=41,
                 n_paths=150, seeds=[args.seeds[0]]
@@ -589,11 +616,9 @@ def calibrate_lambda(args):
         cache[(lmbd, fast)] = (res, es)
         return cache[(lmbd, fast)]
 
-    # 초기 양 끝 평가(FAST)
     res_lo, es_lo = eval_at(lo, fast=True)
     res_hi, es_hi = eval_at(hi, fast=True)
 
-    # 양 끝이 이미 target 이하라면 lo를 채택
     if (es_lo is not None) and (es_hi is not None) and (es_lo <= target) and (es_hi <= target):
         final_res, final_es = eval_at(lo, fast=False)
         final_res['cvar_calibration'] = {
@@ -609,7 +634,6 @@ def calibrate_lambda(args):
         }
         return final_res
 
-    # 필요한 경우 hi 확장(FAST)
     expand = 0
     while (es_lo is not None) and (es_hi is not None) and (es_lo > target) and (es_hi > target) and expand < 3:
         hi *= 2.0
@@ -618,40 +642,22 @@ def calibrate_lambda(args):
 
     best = (lo, res_lo, es_lo)
     prev_es = None
-
     for _ in range(max_iter):
         mid = 0.5 * (lo + hi)
         res_mid, es_mid = eval_at(mid, fast=True)
         history.append({'lambda': float(mid), 'ES95': float(es_mid) if es_mid is not None else None})
-
-        # plateau 감지
         if prev_es is not None and es_mid is not None and abs(es_mid - prev_es) < 1e-4:
-            best = (mid, res_mid, es_mid)
-            status = 'plateau'
-            break
+            best = (mid, res_mid, es_mid); status = 'plateau'; break
         prev_es = es_mid
-
         if es_mid is None:
-            lo = mid
-            best = (mid, res_mid, es_mid)
-            status = 'incomplete'
-            continue
-
+            lo = mid; best = (mid, res_mid, es_mid); status = 'incomplete'; continue
         if abs(es_mid - target) <= tol:
-            best = (mid, res_mid, es_mid)
-            status = 'ok'
-            break
-
-        if es_mid > target:
-            lo = mid
-        else:
-            hi = mid
-        best = (mid, res_mid, es_mid)
-        status = 'ok'
+            best = (mid, res_mid, es_mid); status = 'ok'; break
+        if es_mid > target: lo = mid
+        else: hi = mid
+        best = (mid, res_mid, es_mid); status = 'ok'
 
     chosen_lambda, _, _ = best
-
-    # 최종 고해상도 평가
     final_res, final_es = eval_at(chosen_lambda, fast=False)
     final_res['cvar_calibration'] = {
         'selected_lambda': float(chosen_lambda),
@@ -688,33 +694,33 @@ def main():
     p.add_argument("--es_mode", type=str, default="wealth", choices=["wealth", "loss"])
     p.add_argument("--outputs", type=str, default="./outputs")
 
-    # === HJB 옵션 ===
+    # HJB
     p.add_argument("--hjb_W_grid", type=int, default=None)
     p.add_argument("--hjb_Nshock", type=int, default=None)
     p.add_argument("--hjb_eta_n", type=int, default=None)
 
-    # === Hedge ===
+    # Hedge
     p.add_argument("--hedge", choices=["on", "off"], default="off")
     p.add_argument("--hedge_mode", choices=["mu", "sigma", "downside"], default="sigma")
     p.add_argument("--hedge_cost", type=float, default=0.005)
     p.add_argument("--hedge_sigma_k", type=float, default=0.20)
-    p.add_argument("--hedge_tx", type=float, default=0.0)  # ★ 추가: 발동시 추가비용(연)
+    p.add_argument("--hedge_tx", type=float, default=0.0)
 
-    # === Market realism ===
+    # Market
     p.add_argument("--market_mode", choices=["iid", "bootstrap"], default="iid")
     p.add_argument("--market_csv", type=str, default=None)
     p.add_argument("--bootstrap_block", type=int, default=24)
     p.add_argument("--use_real_rf", choices=["on", "off"], default="on")
 
-    # === Mortality ===
+    # Mortality
     p.add_argument("--mortality", choices=["on", "off"], default="off")
-    p.add_argument("--mort_table", type=str, default=None)  # CSV or preset name
+    p.add_argument("--mort_table", type=str, default=None)
     p.add_argument("--age0", type=int, default=65)
     p.add_argument("--sex", choices=["M", "F"], default="M")
     p.add_argument("--bequest_kappa", type=float, default=0.0)
     p.add_argument("--bequest_gamma", type=float, default=1.0)
 
-    # === CVaR calibration ===
+    # CVaR calibration
     p.add_argument("--cvar_target", type=float, default=CVAR_TARGET_DEFAULT)
     p.add_argument("--cvar_tol", type=float, default=CVAR_TOL_DEFAULT)
     p.add_argument("--lambda_min", type=float, default=LAMBDA_MIN_DEFAULT)
@@ -722,10 +728,10 @@ def main():
     p.add_argument("--calib_fast", choices=["on", "off"], default="on")
     p.add_argument("--calib_max_iter", type=int, default=8)
 
-    # === autosave ===
+    # autosave
     p.add_argument("--autosave", choices=["on", "off"], default="off")
 
-    # === RL 학습 설정 ===
+    # RL
     p.add_argument("--rl_epochs", type=int, default=60)
     p.add_argument("--rl_steps_per_epoch", type=int, default=2048)
     p.add_argument("--rl_n_paths_eval", type=int, default=300)
@@ -734,7 +740,6 @@ def main():
     p.add_argument("--value_coef", type=float, default=0.5)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--max_grad_norm", type=float, default=0.5)
-    # shaping / constraints
     p.add_argument("--rl_q_cap", type=float, default=0.0)
     p.add_argument("--teacher_eps0", type=float, default=0.0)
     p.add_argument("--teacher_decay", type=float, default=1.0)
@@ -743,15 +748,22 @@ def main():
     p.add_argument("--crra_gamma", type=float, default=3.0)
     p.add_argument("--u_scale", type=float, default=0.0)
 
-    # === Stage-wise CVaR ===
+    # Lite overrides
+    p.add_argument("--q_floor", type=float, default=None)
+    p.add_argument("--beta", type=float, default=None)
+
+    # Stage-wise CVaR
     p.add_argument("--cvar_stage", choices=["on", "off"], default="off")
     p.add_argument("--alpha_stage", type=float, default=0.95)
     p.add_argument("--lambda_stage", type=float, default=0.0)
     p.add_argument("--cstar_mode", choices=["fixed", "annuity", "vpw"], default="annuity")
-    p.add_argument("--cstar_m", type=float, default=0.04/12)  # fixed일 때 사용
+    p.add_argument("--cstar_m", type=float, default=0.04/12)
 
-    # === XAI ===
+    # XAI
     p.add_argument("--xai_on", choices=["on", "off"], default="on")
+
+    # QUIET (전역 무음)
+    p.add_argument("--quiet", choices=["on", "off"], default="on")
 
     args = p.parse_args()
 
@@ -762,8 +774,8 @@ def main():
     else:
         out = run_once(args)
 
+    # 결과는 한 줄 JSON로만 출력
     print(json.dumps(out, ensure_ascii=False))
-
 
 if __name__ == "__main__":
     main()
