@@ -24,9 +24,11 @@ _METRICS_HEADER: list[str] = [
     "horizon_years", "steps_per_year",
     "seeds", "n_paths_eval", "tag",
     # consumption (bands & ES-like on consumption)
-    "p10_c_last", "p50_c_last", "p90_c_last", "C_ES95_avg",
+    "p10_c_last", "p50_c_last", "p90_c_last", "C_ES95_avg", "AlivePathRate",
     # annuity overlay (if present)
     "y_ann", "a_factor", "P",
+    # convenience: sweep/overlay params persisted in logs
+    "ann_alpha",
 ]
 
 
@@ -236,6 +238,23 @@ def evaluate(cfg: Any, actor, es_mode: str = "wealth") -> Dict[str, float]:
     env = RetirementEnv(cfg)
     T = int(getattr(env, "T", 0))
 
+    # (NEW) verify injected paths snapshot (quiet=off 때만 1회 출력)
+    if str(getattr(cfg, "quiet", "on")).lower() != "on":
+        def _cs(a):
+            a = _np.asarray(a, dtype=float)
+            return float(_np.nanmean(a[:16])) if a.size else float("nan")
+        try:
+            print(f"[eval] path_cs ret={_cs(getattr(env, 'path_risky', _np.array([], dtype=float))):.6f} "
+                  f"rf={_cs(getattr(env, 'path_safe', _np.array([], dtype=float))):.6f}")
+            pr = getattr(env, "path_risky", None)
+            ps = getattr(env, "path_safe", None)
+            if pr is not None and ps is not None:
+                pr = _np.asarray(pr, dtype=float); ps = _np.asarray(ps, dtype=float)
+                if pr.size >= 2 and ps.size >= 2:
+                    print(f"[eval] head ret={pr[0]:.6f},{pr[1]:.6f} rf={ps[0]:.6f},{ps[1]:.6f}")
+        except Exception:
+            pass
+
     WT: list[float] = []
     early_flags: list[bool] = []
 
@@ -295,27 +314,52 @@ def evaluate(cfg: Any, actor, es_mode: str = "wealth") -> Dict[str, float]:
     m["HedgeKMean"] = float(agg_k_sum / agg_hedge_hits) if agg_hedge_hits > 0 else 0.0
     m["HedgeActiveW"] = float(agg_active_w_sum / agg_hedge_hits) if agg_hedge_hits > 0 else 0.0
 
-    # consumption bands + ES-like consumption metric
+    # -----------------------------
+    # Consumption: bands + ES-like
+    # -----------------------------
     if len(C_all) > 0 and T > 0:
         C_mat = _np.vstack(C_all)  # (Npaths, T)
-        p10 = _np.nanpercentile(C_mat, 10, axis=0)
-        p50 = _np.nanpercentile(C_mat, 50, axis=0)
-        p90 = _np.nanpercentile(C_mat, 90, axis=0)
-        Cmean_paths = _np.nanmean(C_mat, axis=1)
-        C_ES95_avg = float(_np.nanquantile(Cmean_paths, 0.05))
 
-        m.update({
-            "p10_c_last": float(p10[-1]) if p10.size else 0.0,
-            "p50_c_last": float(p50[-1]) if p50.size else 0.0,
-            "p90_c_last": float(p90[-1]) if p90.size else 0.0,
-            "C_ES95_avg": C_ES95_avg,
-        })
+        # AlivePathRate: 소비가 한 번이라도 관측된 경로 비율
+        alive_rate = float(_np.mean(~_np.all(_np.isnan(C_mat), axis=1)))
+        m["AlivePathRate"] = alive_rate
 
-        # save bands for plotting
-        bands_dir = os.path.join(getattr(cfg, "outputs", "./outputs"), "_bands")
-        os.makedirs(bands_dir, exist_ok=True)
-        pd.DataFrame({"t": _np.arange(T, dtype=int), "p10": p10, "p50": p50, "p90": p90}) \
-          .to_csv(os.path.join(bands_dir, "consumption_bands.csv"), index=False, encoding="utf-8")
+        # (선택) 종료 이후 소비=0으로 간주하려면 다음 라인을 활성화
+        # C_mat = _np.where(_np.isnan(C_mat), 0.0, C_mat)
+
+        # 유효 열(전부 NaN이 아닌 시점)만 골라서 밴드 계산
+        valid_cols = _np.where(~_np.all(_np.isnan(C_mat), axis=0))[0]
+        if valid_cols.size > 0:
+            last_idx = int(valid_cols[-1])
+
+            # 유효 구간에 대해서만 백분위 계산
+            p10_v = _np.nanpercentile(C_mat[:, valid_cols], 10, axis=0)
+            p50_v = _np.nanpercentile(C_mat[:, valid_cols], 50, axis=0)
+            p90_v = _np.nanpercentile(C_mat[:, valid_cols], 90, axis=0)
+
+            # 마지막 유효 시점의 last 지표
+            m["p10_c_last"] = float(_np.nanpercentile(C_mat[:, last_idx], 10))
+            m["p50_c_last"] = float(_np.nanpercentile(C_mat[:, last_idx], 50))
+            m["p90_c_last"] = float(_np.nanpercentile(C_mat[:, last_idx], 90))
+
+            # ES-like on consumption: 경로별 평균소비의 하위 5% 분위수
+            Cmean_paths = _np.nanmean(C_mat, axis=1)
+            m["C_ES95_avg"] = float(_np.nanquantile(Cmean_paths, 0.05))
+
+            # bands 저장은 --bands 토글(on일 때만 IO)
+            if str(getattr(cfg, "bands", "on")).lower() == "on":
+                bands_dir = os.path.join(getattr(cfg, "outputs", "./outputs"), "_bands")
+                os.makedirs(bands_dir, exist_ok=True)
+                bands = _np.full((3, T), _np.nan, dtype=float)
+                bands[:, valid_cols] = _np.vstack([p10_v, p50_v, p90_v])
+                pd.DataFrame({
+                    "t": _np.arange(T, dtype=int),
+                    "p10": bands[0], "p50": bands[1], "p90": bands[2]
+                }).to_csv(os.path.join(bands_dir, "consumption_bands.csv"),
+                         index=False, encoding="utf-8")
+        else:
+            # 모든 열이 NaN인 드문 케이스: 보수적으로 0 처리
+            m.update({"p10_c_last": 0.0, "p50_c_last": 0.0, "p90_c_last": 0.0, "C_ES95_avg": 0.0})
 
     return m
 
@@ -369,7 +413,7 @@ def save_metrics_autocsv(metrics: dict, cfg: Any, outputs: Optional[str] = None)
     """
     outputs/_logs/metrics.csv에 한 줄 append.
     - 최신 헤더와 다르면 자동으로 마이그레이션 수행(재발 방지).
-    - 소비/연금 컬럼 포함 → 논문 표/그림 바로 내보내기.
+    - 소비/연금/보조지표 컬럼 포함 → 논문 표/그림 바로 내보내기.
     """
     out_dir = outputs or getattr(cfg, "outputs", "./outputs")
     logs_dir = os.path.join(out_dir, "_logs")
@@ -425,10 +469,13 @@ def save_metrics_autocsv(metrics: dict, cfg: Any, outputs: Optional[str] = None)
         "p50_c_last": metrics.get("p50_c_last"),
         "p90_c_last": metrics.get("p90_c_last"),
         "C_ES95_avg": metrics.get("C_ES95_avg"),
+        "AlivePathRate": metrics.get("AlivePathRate"),
         # annuity overlay
         "y_ann": metrics.get("y_ann"),
         "a_factor": metrics.get("a_factor"),
         "P": metrics.get("P"),
+        # sweep/overlay params
+        "ann_alpha": getattr(cfg, "ann_alpha", None),
     }
 
     write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0

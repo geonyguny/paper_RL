@@ -1,14 +1,17 @@
 # project/runner/cli.py
 from __future__ import annotations
-import argparse, json
+import argparse, json, os
 from ..config import (
     CVAR_TARGET_DEFAULT, CVAR_TOL_DEFAULT, LAMBDA_MIN_DEFAULT, LAMBDA_MAX_DEFAULT
 )
 from .run import run_once, run_rl
 from .calibrate import calibrate_lambda
 
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
+
+    # Core
     p.add_argument("--asset", type=str, default="KR")
     p.add_argument("--method", type=str, default="hjb", choices=["hjb", "rl", "rule"])
     p.add_argument("--baseline", type=str, default=None)
@@ -91,7 +94,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--alpha_stage", type=float, default=0.95)
     p.add_argument("--lambda_stage", type=float, default=0.0)
     p.add_argument("--cstar_mode", choices=["fixed", "annuity", "vpw"], default="annuity")
-    p.add_argument("--cstar_m", type=float, default=0.04/12)
+    p.add_argument("--cstar_m", type=float, default=0.04 / 12)
 
     # XAI
     p.add_argument("--xai_on", choices=["on", "off"], default="on")
@@ -106,12 +109,40 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--ann_d", type=int, default=0)
     p.add_argument("--ann_index", choices=["real", "nominal"], default="real")
 
+    # ---- New: Bands 저장 토글 / 데이터 윈도잉 / 프로파일 ----
+    p.add_argument("--bands", choices=["on", "off"], default="on",
+                   help="consumption bands 저장(on/off). off면 _bands 파일 미생성")
+    p.add_argument("--data_window", type=str, default=None,
+                   help="YYYY-MM:YYYY-MM 형식 기간 슬라이스 (예: 2005-01:2020-12)")
+    p.add_argument("--data_profile", choices=["dev", "full"], default=None,
+                   help="market_csv 미지정 시 기본 CSV 경로를 프로파일로 자동 설정(dev/full)")
+
     return p
+
+
+def _apply_data_profile_defaults(args: argparse.Namespace) -> None:
+    """
+    --data_profile 지정 & --market_csv 미지정 시,
+    project/data/market 하위의 기본 CSV 경로를 자동 설정.
+    """
+    if getattr(args, "data_profile", None) and not getattr(args, "market_csv", None):
+        base = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "data", "market")
+        )
+        if args.data_profile == "dev":
+            args.market_csv = os.path.abspath(os.path.join(base, "kr_us_gold_bootstrap_mini.csv"))
+        elif args.data_profile == "full":
+            args.market_csv = os.path.abspath(os.path.join(base, "kr_us_gold_bootstrap_full.csv"))
+
 
 def main():
     p = _build_arg_parser()
     args = p.parse_args()
 
+    # Set default market_csv from data_profile when not provided
+    _apply_data_profile_defaults(args)
+
+    # Route by method
     if args.method == "rl":
         out = run_rl(args)
     elif args.method == "hjb" and (args.cvar_target is not None):
@@ -121,5 +152,6 @@ def main():
 
     print(json.dumps(out, ensure_ascii=False))
 
+
 if __name__ == "__main__":
-        main()
+    main()

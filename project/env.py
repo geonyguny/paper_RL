@@ -1,5 +1,6 @@
+# project/env.py
 import numpy as _np
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Any
 from .config import SimConfig
 from .market import IIDNormalMarket, BootstrapMarket
 from .mortality import MortalitySampler
@@ -27,17 +28,17 @@ class RetirementEnv:
     def __init__(self, cfg: SimConfig):
         self.cfg = cfg
         self.m = cfg.monthly()  # {'mu_m','sigma_m','rf_m','phi_m','p_m','g_m','beta_m'}
-        self.T = cfg.horizon_years * cfg.steps_per_year
+        self.T = int(cfg.horizon_years) * int(cfg.steps_per_year)
 
-        # Market
-        mode = str(getattr(cfg, "market_mode", "iid"))
+        # Market backend (fallback)
+        mode = str(getattr(cfg, "market_mode", "iid")).lower()
         if mode == "bootstrap":
             self.market = BootstrapMarket(cfg)
         else:
             self.market = IIDNormalMarket(cfg)
 
         # Hedge params (monthly)
-        self._hedge_on: bool = bool(getattr(cfg, "hedge_on", False))
+        self._hedge_on: bool = bool(getattr(cfg, "hedge_on", getattr(cfg, "hedge", "off") == "on"))
         self._hedge_mode: str = str(getattr(cfg, "hedge_mode", "mu"))
         hedge_cost_annual = float(getattr(cfg, "hedge_cost", 0.0) or 0.0)
         steps = max(int(cfg.steps_per_year), 1)
@@ -47,53 +48,126 @@ class RetirementEnv:
         self._mu_m: float = float(self.m["mu_m"])
 
         # Mortality
-        self.mortality_on = bool(getattr(cfg, "mortality_on", False))
+        mort_flag = str(getattr(cfg, "mortality", "off")).lower() == "on" or bool(getattr(cfg, "mortality_on", False))
+        self.mortality_on = bool(mort_flag)
         self.age0 = int(getattr(cfg, "age0", 65))
         self.sex  = str(getattr(cfg, "sex", "M"))
-        self.mort = None
-        if self.mortality_on:
-            self.mort = MortalitySampler(getattr(cfg, "mort_table", None))
+        self.mort = MortalitySampler(getattr(cfg, "mort_table", None)) if self.mortality_on else None
 
         # Bequest (optional)
         self.bequest_kappa = float(getattr(cfg, "bequest_kappa", 0.0) or 0.0)
         self.bequest_gamma = float(getattr(cfg, "bequest_gamma", 1.0) or 1.0)
 
+        # ----- Data-injected series (optional) -----
+        self._series_ret  = getattr(cfg, "data_ret_series", None)
+        self._series_rf   = getattr(cfg, "data_rf_series", None)
+        self._series_ok   = (
+            self._series_ret is not None and self._series_rf is not None
+            and len(_np.asarray(self._series_ret)) > 0 and len(_np.asarray(self._series_rf)) > 0
+        )
+        self._boot_block  = int(getattr(cfg, "bootstrap_block", 24) or 24)
+
+        # Episode RNG & paths
+        self._rng: _np.random.Generator = _np.random.default_rng()
+        self.path_risky: _np.ndarray = _np.zeros(self.T, dtype=float)
+        self.path_safe:  _np.ndarray = _np.zeros(self.T, dtype=float)
+
         self.reset()
 
-    # internal: hedge transform
+    # --------------------
+    # internals
+    # --------------------
     def _apply_hedge(self, r_path: _np.ndarray) -> _np.ndarray:
         if not self._hedge_on:
             return r_path
         if self._hedge_mode == "mu":
             return r_path - self._hedge_cost_m
-        else:
-            return self._mu_m + (1.0 - self._hedge_sigma_k) * (r_path - self._mu_m)
+        # sigma-mode: shrink deviations around μ_m
+        return self._mu_m + (1.0 - self._hedge_sigma_k) * (r_path - self._mu_m)
 
+    def _make_mbb_path(self, rng: _np.random.Generator, series: _np.ndarray, T: int, B: int) -> _np.ndarray:
+        """Moving-Block Bootstrap로 길이 T 경로 생성."""
+        arr = _np.asarray(series, dtype=float)
+        n = int(arr.shape[0])
+        if n <= 0:
+            raise ValueError("empty series for bootstrap")
+        B = max(1, int(B))
+        out = _np.empty(T, dtype=float)
+        filled = 0
+        while filled < T:
+            i0 = int(rng.integers(0, max(n - B, 1)))
+            take = min(B, T - filled)
+            out[filled:filled + take] = arr[i0:i0 + take]
+            filled += take
+        return out
+
+    def _obs(self) -> Dict[str, Any]:
+        # 간단 dict 관측치
+        return dict(t=self.t, W=self.W, W0=self.W0, peakW=self.peakW, age=self.age)
+
+    # --------------------
+    # API
+    # --------------------
     def reset(self, seed: Optional[int] = None, W0: float = 1.0) -> Dict:
+        # reseed (internal RNG + backend)
         if seed is not None:
-            self.market.seed(seed)
+            try:
+                self._rng = _np.random.default_rng(int(seed))
+            except Exception:
+                self._rng = _np.random.default_rng()
+            if hasattr(self.market, "seed"):
+                try:
+                    self.market.seed(int(seed))
+                except Exception:
+                    pass
+
         self.t = 0
         self.W = float(W0)
         self.W0 = float(W0)
         self.peakW = float(W0)
-        # age in years (float), increase by 1/12 per step
         self.age = float(self.age0)
 
-        # Pre-sample returns
-        if isinstance(self.market, BootstrapMarket):
-            risky, safe = self.market.sample_paths(self.T, block=getattr(self.cfg, "bootstrap_block", 24))
-            self.path_risky = self._apply_hedge(_np.asarray(risky, dtype=float))
-            self.path_safe  = _np.asarray(safe, dtype=float)
-        else:
-            base_path = self.market.sample_risky(self.T)
-            self.path_risky = self._apply_hedge(_np.asarray(base_path, dtype=float))
-            self.path_safe  = _np.full(self.T, float(self.m["rf_m"]), dtype=float)
+        use_bootstrap = str(getattr(self.cfg, "market_mode", "iid")).lower() == "bootstrap"
+        used_injected = False
 
-        return self._state()
+        # Data-injected 우선
+        if use_bootstrap and self._series_ok:
+            B = self._boot_block
+            risky = self._make_mbb_path(self._rng, self._series_ret, self.T, B)
+            safe  = self._make_mbb_path(self._rng, self._series_rf,  self.T, B)
+            # sanity: all-non-finite or all-zero → fallback
+            if _np.all(~_np.isfinite(risky)) or _np.allclose(risky, 0.0):
+                risky = None
+            if _np.all(~_np.isfinite(safe)) or _np.allclose(safe, 0.0):
+                safe = None
+            if risky is not None and safe is not None:
+                self.path_risky = self._apply_hedge(_np.asarray(risky, dtype=float))
+                self.path_safe  = _np.asarray(safe, dtype=float)
+                used_injected = True
 
-    def _state(self) -> Dict:
-        # 관측: [t, W, age_norm, 0] 형태로 제공하는 쪽에서 변환 (_GymShim)
-        return dict(t=self.t, W=self.W, W0=self.W0, peakW=self.peakW, age=self.age)
+        # Backend fallback
+        if not used_injected:
+            if isinstance(self.market, BootstrapMarket):
+                risky, safe = self.market.sample_paths(self.T, block=getattr(self.cfg, "bootstrap_block", 24))
+                self.path_risky = self._apply_hedge(_np.asarray(risky, dtype=float))
+                self.path_safe  = _np.asarray(safe, dtype=float)
+            else:
+                base_path = self.market.sample_risky(self.T)
+                self.path_risky = self._apply_hedge(_np.asarray(base_path, dtype=float))
+                self.path_safe  = _np.full(self.T, float(self.m["rf_m"]), dtype=float)
+
+        # one-line debug (quiet=off)
+        if str(getattr(self.cfg, "quiet", "on")).lower() != "on":
+            def _cs(arr: _np.ndarray) -> float:
+                arr = _np.asarray(arr, dtype=float)
+                return float(_np.nanmean(arr[:16])) if arr.size else float("nan")
+            print(
+                f"[env] injected={used_injected} "
+                f"ret_cs={_cs(self.path_risky):.6f} rf_cs={_cs(self.path_safe):.6f} "
+                f"T={self.T} B={self._boot_block}"
+            )
+
+        return self._obs()
 
     def step(self, q: float, w: float) -> Tuple[Dict, float, bool, bool, Dict]:
         info: Dict = {}
@@ -101,17 +175,23 @@ class RetirementEnv:
         # 1) clipping
         w = float(_np.clip(float(w), 0.0, self.cfg.w_max))
         q = float(_np.clip(float(q), 0.0, 1.0))
-        if getattr(self.cfg, "floor_on", False) and self.cfg.f_min_real > 0.0 and self.W > 0.0:
-            q_min = min(1.0, self.cfg.f_min_real / self.W)
+        if getattr(self.cfg, "floor_on", False) and getattr(self.cfg, "f_min_real", 0.0) > 0.0 and self.W > 0.0:
+            q_min = min(1.0, float(self.cfg.f_min_real) / self.W)
             q = max(q, q_min)
 
         # 2) consumption
-        c_t = q * self.W
+        c_t = float(q * self.W)
         W_net = self.W - c_t
 
-        # 3) returns (risky + safe)
-        R_risk = float(self.path_risky[self.t])
-        R_safe = float(self.path_safe[self.t])
+        # 3) returns
+        idx = min(max(self.t, 0), self.T - 1)
+        R_risk = float(self.path_risky[idx])
+        R_safe = float(self.path_safe[idx])
+
+        # print first two steps (quiet=off)
+        if str(getattr(self.cfg, "quiet", "on")).lower() != "on" and self.t < 2:
+            print(f"[env] t={self.t} R_risk={R_risk:.6f} R_safe={R_safe:.6f}")
+
         gross = 1.0 + (w * R_risk) + ((1.0 - w) * R_safe)
         W_next = W_net * gross
 
@@ -119,8 +199,9 @@ class RetirementEnv:
         W_next = W_next - float(self.m["phi_m"]) * self.W
 
         # clip / bookkeeping
-        if hasattr(self.cfg, "hjb_W_max"):
-            W_next = float(_np.clip(W_next, 0.0, self.cfg.hjb_W_max))
+        hjb_W_max = getattr(self.cfg, "hjb_W_max", None)
+        if hjb_W_max is not None:
+            W_next = float(_np.clip(W_next, 0.0, float(hjb_W_max)))
         else:
             W_next = float(max(W_next, 0.0))
 
@@ -130,15 +211,13 @@ class RetirementEnv:
         self.W = W_next
         self.peakW = max(self.peakW, self.W)
 
-        # 5) mortality
+        # 5) mortality (internal RNG)
         died = False
         bequest_val = 0.0
         if self.mortality_on and (self.W > 0.0):
-            p = float(self.mort.p_death_month(self.age))
-            # Bernoulli draw using numpy
-            if _np.random.rand() < p:
+            p = float(self.mort.p_death_month(self.age)) if self.mort is not None else 0.0
+            if self._rng.random() < max(0.0, min(p, 1.0)):
                 died = True
-                # simple bequest utility (if used in reward shaping)
                 kappa = self.bequest_kappa
                 gamma = self.bequest_gamma
                 if kappa > 0.0:
@@ -148,10 +227,18 @@ class RetirementEnv:
                         bequest_val = kappa * ((max(self.W, 0.0) ** (1.0 - gamma) - 1.0) / (1.0 - gamma))
         self.age += 1.0 / float(self.cfg.steps_per_year)
 
+        info["consumption"] = c_t
         info["W_T"] = float(self.W)
+
+        # hedge info
+        if self._hedge_on:
+            info["hedge_active"] = True
+            info["hedge_k"] = float(self._hedge_sigma_k if self._hedge_mode == "sigma" else self._hedge_cost_m)
+            info["w"] = float(w)
+
         if died:
             info["death"] = True
             info["bequest"] = float(bequest_val)
 
         done = bool(self.t >= self.T or self.W <= 0.0 or died)
-        return self._state(), c_t, done, early_ruin, info
+        return self._obs(), c_t, done, early_ruin, info
