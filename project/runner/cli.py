@@ -1,8 +1,17 @@
 # project/runner/cli.py
 from __future__ import annotations
-import argparse, json, os
+
+import argparse
+import json
+import os
+import re
+from typing import Optional
+
 from ..config import (
-    CVAR_TARGET_DEFAULT, CVAR_TOL_DEFAULT, LAMBDA_MIN_DEFAULT, LAMBDA_MAX_DEFAULT
+    CVAR_TARGET_DEFAULT,
+    CVAR_TOL_DEFAULT,
+    LAMBDA_MIN_DEFAULT,
+    LAMBDA_MAX_DEFAULT,
 )
 from .run import run_once, run_rl
 from .calibrate import calibrate_lambda
@@ -109,15 +118,32 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--ann_d", type=int, default=0)
     p.add_argument("--ann_index", choices=["real", "nominal"], default="real")
 
-    # ---- New: Bands 저장 토글 / 데이터 윈도잉 / 프로파일 ----
-    p.add_argument("--bands", choices=["on", "off"], default="on",
-                   help="consumption bands 저장(on/off). off면 _bands 파일 미생성")
-    p.add_argument("--data_window", type=str, default=None,
-                   help="YYYY-MM:YYYY-MM 형식 기간 슬라이스 (예: 2005-01:2020-12)")
-    p.add_argument("--data_profile", choices=["dev", "full"], default=None,
-                   help="market_csv 미지정 시 기본 CSV 경로를 프로파일로 자동 설정(dev/full)")
+    # New: Bands 저장 토글 / 데이터 윈도우 / 프로파일 / 태그
+    p.add_argument(
+        "--bands", choices=["on", "off"], default="on",
+        help="consumption bands 저장(on/off). off면 _bands 파일 미생성",
+    )
+    p.add_argument(
+        "--data_window", type=str, default=None,
+        help="YYYY-MM:YYYY-MM 형식 기간 슬라이스 (예: 2005-01:2020-12)",
+    )
+    p.add_argument(
+        "--data_profile", choices=["dev", "full"], default=None,
+        help="market_csv 미지정 시 기본 CSV 경로를 프로파일로 자동 설정(dev/full)",
+    )
+    p.add_argument(
+        "--tag", type=str, default=None,
+        help="실험 태그(로그/metrics에 기록)",
+    )
 
     return p
+
+
+# --------------------------
+# Helpers
+# --------------------------
+
+_WINDOW_RE = re.compile(r"^\d{4}-\d{2}:\d{4}-\d{2}$")
 
 
 def _apply_data_profile_defaults(args: argparse.Namespace) -> None:
@@ -135,12 +161,34 @@ def _apply_data_profile_defaults(args: argparse.Namespace) -> None:
             args.market_csv = os.path.abspath(os.path.join(base, "kr_us_gold_bootstrap_full.csv"))
 
 
+def _validate_args(args: argparse.Namespace) -> None:
+    # data_window 형식 체크
+    if args.data_window is not None:
+        s = str(args.data_window).strip()
+        if s and not _WINDOW_RE.match(s):
+            raise SystemExit(
+                f"--data_window 형식 오류: '{args.data_window}'. "
+                "예: 2005-01:2020-12"
+            )
+    # bootstrap인데 csv 미지정이면 사용자 친화적 에러
+    if args.method in ("hjb", "rule", "rl") and args.market_mode == "bootstrap":
+        if not args.market_csv and not args.data_profile:
+            raise SystemExit(
+                "market_mode=bootstrap 사용 시 --market_csv 또는 --data_profile(dev|full) 중 하나는 필수입니다."
+            )
+
+
+# --------------------------
+# Main
+# --------------------------
+
 def main():
     p = _build_arg_parser()
     args = p.parse_args()
 
-    # Set default market_csv from data_profile when not provided
+    # Default market_csv from data_profile when not provided
     _apply_data_profile_defaults(args)
+    _validate_args(args)
 
     # Route by method
     if args.method == "rl":

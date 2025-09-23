@@ -95,6 +95,10 @@ def run_once(args) -> Dict[str, Any]:
         cfg: SimConfig = make_cfg(args)
         ensure_dir(args.outputs)
 
+        # NEW: ensure tag is present in cfg for logging
+        if getattr(args, "tag", None) is not None:
+            setattr(cfg, "tag", args.tag)
+
         # 실데이터 로더와 연결 (bootstrap일 때만)
         _wire_market_data(cfg, args)
 
@@ -144,6 +148,10 @@ def run_rl(args):
     # RL도 동일하게 cfg 주입 → trainer 내부 Env 생성 시 실데이터 사용
     cfg: SimConfig = make_cfg(args)
     ensure_dir(args.outputs)
+
+    # NEW: ensure tag is present in cfg for logging (RL runs too)
+    if getattr(args, "tag", None) is not None:
+        setattr(cfg, "tag", args.tag)
 
     _wire_market_data(cfg, args)
 
