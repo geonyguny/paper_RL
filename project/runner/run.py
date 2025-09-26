@@ -95,29 +95,35 @@ def run_once(args) -> Dict[str, Any]:
         cfg: SimConfig = make_cfg(args)
         ensure_dir(args.outputs)
 
-        # NEW: ensure tag is present in cfg for logging
+        # tag → cfg 주입 (autosave에서 사용)
         if getattr(args, "tag", None) is not None:
             setattr(cfg, "tag", args.tag)
 
         # 실데이터 로더와 연결 (bootstrap일 때만)
         _wire_market_data(cfg, args)
 
-        # 연금 오버레이(필요 시)
-        ann_state = None
-        if getattr(args, "ann_on", "off") == "on" and float(getattr(args, "ann_alpha", 0.0)) > 0.0:
-            ann_state = setup_annuity_overlay(cfg, args)
+        # 연금 오버레이(필요 시 설정)
+        ann_enabled = (
+            str(getattr(args, "ann_on", "off")).lower() == "on"
+            and float(getattr(args, "ann_alpha", 0.0) or 0.0) > 0.0
+        )
+        if ann_enabled:
+            setup_annuity_overlay(cfg, args)
 
         # 정책 생성 → 평가
         actor = build_actor(cfg, args)
         m = evaluate(cfg, actor, es_mode=args.es_mode)
 
-    # 연금 파생 파라미터 메트릭에 병합
-    if ann_state is not None and isinstance(m, dict):
+    # --- 메트릭 병합: 연금 파생 파라미터는 항상 기록(미설정 시 0.0) ---
+    if isinstance(m, dict):
+        y_ann = float(getattr(cfg, "y_ann", 0.0) or 0.0)
+        a_fac = float(getattr(cfg, "ann_a_factor", 0.0) or 0.0)
+        P_val = float(getattr(cfg, "ann_P", 0.0) or 0.0)
         m.update({
-            "y_ann": float(getattr(cfg, "y_ann", 0.0)),
-            "ann_a_factor": float(getattr(cfg, "ann_a_factor", 0.0)),  # 명시 키
-            "a_factor": float(getattr(cfg, "ann_a_factor", 0.0)),      # 하위호환
-            "P": float(getattr(cfg, "ann_P", 0.0)),
+            "y_ann": y_ann if ann_enabled or y_ann != 0.0 else 0.0,
+            "ann_a_factor": a_fac if ann_enabled or a_fac != 0.0 else 0.0,  # 편의상 유지
+            "a_factor": a_fac if ann_enabled or a_fac != 0.0 else 0.0,      # CSV에 쓰이는 필드
+            "P": P_val if ann_enabled or P_val != 0.0 else 0.0,
         })
 
     # 총 평가 경로 수
@@ -149,13 +155,17 @@ def run_rl(args):
     cfg: SimConfig = make_cfg(args)
     ensure_dir(args.outputs)
 
-    # NEW: ensure tag is present in cfg for logging (RL runs too)
+    # tag → cfg 주입 (RL도 동일)
     if getattr(args, "tag", None) is not None:
         setattr(cfg, "tag", args.tag)
 
     _wire_market_data(cfg, args)
 
-    if getattr(args, "ann_on", "off") == "on" and float(getattr(args, "ann_alpha", 0.0)) > 0.0:
+    ann_enabled = (
+        str(getattr(args, "ann_on", "off")).lower() == "on"
+        and float(getattr(args, "ann_alpha", 0.0) or 0.0) > 0.0
+    )
+    if ann_enabled:
         setup_annuity_overlay(cfg, args)
 
     try:

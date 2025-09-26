@@ -138,7 +138,7 @@ def _sample_death_month(
 
 def run_episode(
     env: RetirementEnv,
-    actor: Callable[[_np.ndarray], Tuple[float, float]],
+    actor: Callable[[Dict[str, Any]], Tuple[float, float]],
     seed: int = 0,
 ) -> Tuple[_np.ndarray, _np.ndarray, bool, dict[str, float]]:
     """
@@ -253,6 +253,7 @@ def evaluate(cfg: Any, actor, es_mode: str = "wealth") -> Dict[str, float]:
                 if pr.size >= 2 and ps.size >= 2:
                     print(f"[eval] head ret={pr[0]:.6f},{pr[1]:.6f} rf={ps[0]:.6f},{ps[1]:.6f}")
         except Exception:
+            # 디버그 출력 실패는 시뮬레이션에 영향 주지 않음
             pass
 
     WT: list[float] = []
@@ -296,7 +297,7 @@ def evaluate(cfg: Any, actor, es_mode: str = "wealth") -> Dict[str, float]:
 
     # wealth/loss & ruin
     if WT_arr.size == 0:
-        m = dict(EW=0.0, ES95=0.0, EL=0.0, mean_WT=0.0)
+        m: Dict[str, float] = dict(EW=0.0, ES95=0.0, EL=0.0, mean_WT=0.0)
         ruin_rate = 0.0
     else:
         ruin_rate = float(_np.mean(_np.logical_or(early_arr, WT_arr <= 0.0)))
@@ -360,6 +361,17 @@ def evaluate(cfg: Any, actor, es_mode: str = "wealth") -> Dict[str, float]:
         else:
             # 모든 열이 NaN인 드문 케이스: 보수적으로 0 처리
             m.update({"p10_c_last": 0.0, "p50_c_last": 0.0, "p90_c_last": 0.0, "C_ES95_avg": 0.0})
+
+    # -------- NEW: 분포 진단 프린트 (quiet=off일 때만) --------
+    if str(getattr(cfg, "quiet", "on")).lower() != "on":
+        try:
+            wt_std = float(_np.nanstd(WT_arr)) if WT_arr.size > 0 else float("nan")
+            wt_min = float(_np.nanmin(WT_arr)) if WT_arr.size > 0 else float("nan")
+            wt_max = float(_np.nanmax(WT_arr)) if WT_arr.size > 0 else float("nan")
+            print(f"[dbg:evaluate] WT_std={wt_std:.6g} WT_min={wt_min:.6g} WT_max={wt_max:.6g} Ruin={m.get('Ruin'):.3f}")
+        except Exception:
+            pass
+    # ---------------------------------------------------------
 
     return m
 
