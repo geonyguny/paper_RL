@@ -1,12 +1,42 @@
 # project/runner/io_utils.py
 from __future__ import annotations
-import os, csv, datetime
-from typing import Any, Dict
+import os
+import csv
+import json
+import datetime
+from typing import Any, Dict, List
 
-def ensure_dir(path: str): os.makedirs(path, exist_ok=True)
-def now_iso() -> str: return datetime.datetime.now().isoformat(timespec="seconds")
 
+# =========================
+# Constants / Basics
+# =========================
+FIELDNAMES: List[str] = [
+    "ts", "asset", "method", "baseline", "es_mode", "tag",
+    "EW", "ES95", "Ruin", "mean_WT",
+    "w_max", "fee_annual", "lambda_term", "alpha", "F_target",
+    "n_paths",
+    "args_json",
+]
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+def _now_ts_utc() -> str:
+    """YYMMDDTHHMMSS (UTC) short timestamp."""
+    return datetime.datetime.utcnow().strftime("%y%m%dT%H%M%S")
+
+def _metrics_log_dir(outputs_dir: str) -> str:
+    return os.path.join(outputs_dir, "_logs")
+
+def _metrics_log_path(outputs_dir: str) -> str:
+    return os.path.join(_metrics_log_dir(outputs_dir), "metrics.csv")
+
+
+# =========================
+# Slim args
+# =========================
 def slim_args(args) -> dict:
+    """CSV에는 핵심 인자를 JSON으로 보존."""
     keys = [
         "asset", "method", "baseline", "w_max", "fee_annual", "horizon_years",
         "alpha", "lambda_term", "F_target", "p_annual", "g_real_annual",
@@ -23,55 +53,91 @@ def slim_args(args) -> dict:
         "entropy_coef", "value_coef", "lr", "max_grad_norm",
         "q_floor", "beta", "quiet",
         "ann_on", "ann_alpha", "ann_L", "ann_d", "ann_index",
+        # 추가 메타
+        "bands", "data_window", "data_profile", "tag",
     ]
     return {k: getattr(args, k, None) for k in keys}
 
-def append_metrics_csv(path: str, payload: Dict[str, Any]):
-    row = {
-        'ts': now_iso(),
-        'asset': payload.get('asset'),
-        'method': payload.get('method'),
-        'lambda': payload.get('lambda_term'),
-        'F_target': payload.get('F_target'),
-        'alpha': payload.get('alpha'),
-        'ES95': (payload.get('metrics') or {}).get('ES95'),
-        'EW': (payload.get('metrics') or {}).get('EW'),
-        'Ruin': (payload.get('metrics') or {}).get('Ruin'),
-        'mean_WT': (payload.get('metrics') or {}).get('mean_WT'),
-        'hedge_on': (payload.get('args') or {}).get('hedge') == 'on',
-        'hedge_mode': (payload.get('args') or {}).get('hedge_mode'),
-        'fee_annual': payload.get('fee_annual'),
-        'w_max': payload.get('w_max'),
-        'horizon_years': payload.get('horizon_years'),
-        'seeds': (payload.get('args') or {}).get('seeds'),
-        'n_paths': (payload.get('args') or {}).get('n_paths'),
-        'mortality_on': (payload.get('args') or {}).get('mortality') == 'on',
-        'market_mode': (payload.get('args') or {}).get('market_mode'),
-        'ann_on': (payload.get('args') or {}).get('ann_on'),
-        'ann_alpha': (payload.get('args') or {}).get('ann_alpha'),
-        'ann_L': (payload.get('args') or {}).get('ann_L'),
-        'ann_d': (payload.get('args') or {}).get('ann_d'),
-        'ann_index': (payload.get('args') or {}).get('ann_index'),
-        'y_ann': (payload.get('metrics') or {}).get('y_ann'),
-        'a_factor': (payload.get('metrics') or {}).get('a_factor'),
-        'P': (payload.get('metrics') or {}).get('P'),
-    }
-    write_header = not os.path.exists(path)
-    with open(path, 'a', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if write_header: w.writeheader()
-        w.writerow(row)
 
-def do_autosave(metrics: dict, cfg, args, out_payload: dict):
+# =========================
+# CSV header migration
+# =========================
+def _first_line(path: str) -> str:
     try:
-        try:
-            from ..eval import save_metrics_autocsv  # optional
-            csv_path = save_metrics_autocsv(metrics, cfg, outputs=cfg.outputs)
-            print(f"[autosave] metrics -> {csv_path}")
-        except Exception:
-            ensure_dir(os.path.join(cfg.outputs, "_logs"))
-            csv_path = os.path.join(cfg.outputs, "_logs", "metrics.csv")
-            append_metrics_csv(csv_path, out_payload)
-            print(f"[autosave:fallback] metrics -> {csv_path}")
+        with open(path, "r", encoding="utf-8") as f:
+            return f.readline().strip()
+    except Exception:
+        return ""
+
+def _needs_rotation(existing_header: str) -> bool:
+    if not existing_header:
+        return False
+    # 간단 비교: 콤마로 split 후 필드명이 기대 스키마와 다르면 회전
+    current = [h.strip() for h in existing_header.split(",") if h.strip()]
+    return current != FIELDNAMES
+
+def _ensure_metrics_csv(outputs_dir: str) -> str:
+    """헤더가 다르면 기존 파일을 회전(.old_YYMMDDTHHMMSS)하고 새 헤더 생성."""
+    logs_dir = _metrics_log_dir(outputs_dir)
+    ensure_dir(logs_dir)
+    csv_path = _metrics_log_path(outputs_dir)
+
+    if os.path.exists(csv_path):
+        header = _first_line(csv_path)
+        if _needs_rotation(header):
+            ts = _now_ts_utc()
+            rotated = os.path.join(logs_dir, f"metrics_OLD_{ts}.csv")
+            os.replace(csv_path, rotated)
+
+    if not os.path.exists(csv_path):
+        with open(csv_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=FIELDNAMES, quoting=csv.QUOTE_MINIMAL)
+            writer.writeheader()
+
+    return csv_path
+
+
+# =========================
+# Autosave
+# =========================
+def do_autosave(metrics: Dict[str, Any], cfg, args, out_payload: Dict[str, Any]) -> None:
+    """
+    metrics.csv에 안전하게 append.
+    - 스키마 자동 정합성 검사/회전
+    - 고정 필드명/순서
+    - JSON 직렬화로 전체 args 보존
+    """
+    try:
+        csv_path = _ensure_metrics_csv(args.outputs)
+
+        row = {
+            "ts": _now_ts_utc(),
+            "asset": out_payload.get("asset", getattr(cfg, "asset", None)),
+            "method": out_payload.get("method", getattr(args, "method", None)),
+            "baseline": out_payload.get("baseline", getattr(args, "baseline", None)),
+            "es_mode": out_payload.get("es_mode", getattr(args, "es_mode", None)),
+            "tag": getattr(cfg, "tag", None) or getattr(args, "tag", None) or "",
+            "EW": (metrics or {}).get("EW"),
+            "ES95": (metrics or {}).get("ES95"),
+            "Ruin": (metrics or {}).get("Ruin"),
+            "mean_WT": (metrics or {}).get("mean_WT"),
+            "w_max": getattr(cfg, "w_max", None),
+            "fee_annual": out_payload.get(
+                "fee_annual",
+                getattr(cfg, "phi_adval", getattr(cfg, "fee_annual", None)),
+            ),
+            "lambda_term": out_payload.get("lambda_term", getattr(cfg, "lambda_term", None)),
+            "alpha": out_payload.get("alpha", getattr(cfg, "alpha", None)),
+            "F_target": out_payload.get("F_target", getattr(cfg, "F_target", None)),
+            "n_paths": out_payload.get("n_paths"),
+            "args_json": json.dumps(slim_args(args), ensure_ascii=False),
+        }
+
+        with open(csv_path, "a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=FIELDNAMES, quoting=csv.QUOTE_MINIMAL)
+            writer.writerow(row)
+
+        print(f"[autosave] metrics -> {csv_path}")
+
     except Exception as e:
         print(f"[autosave] skipped: {e}")

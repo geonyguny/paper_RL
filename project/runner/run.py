@@ -150,7 +150,14 @@ def run_once(args) -> Dict[str, Any]:
     return out
 
 
-def run_rl(args):
+def run_rl(args) -> Dict[str, Any]:
+    """
+    RL 학습 러너:
+    - cfg 구성 및 실데이터 연결
+    - (선택) 연금 오버레이 주입
+    - A2C 학습 후 요약 메트릭 반환
+    - es_mode 출력은 인자(args.es_mode)를 그대로 반영
+    """
     # RL도 동일하게 cfg 주입 → trainer 내부 Env 생성 시 실데이터 사용
     cfg: SimConfig = make_cfg(args)
     ensure_dir(args.outputs)
@@ -173,17 +180,29 @@ def run_rl(args):
     except Exception as e:
         raise SystemExit(f"RL trainer import failed: {e}")
 
-    fields = train_rl(
+    fields: Dict[str, Any] = train_rl(
         cfg,
-        seed_list=args.seeds,
+        seed_list=getattr(args, "seeds", []),
         outputs=args.outputs,
-        n_paths_eval=args.rl_n_paths_eval,
-        rl_epochs=args.rl_epochs,
-        steps_per_epoch=args.rl_steps_per_epoch,
-        lr=args.lr, gae_lambda=args.gae_lambda,
-        entropy_coef=args.entropy_coef, value_coef=args.value_coef,
-        max_grad_norm=args.max_grad_norm,
+        n_paths_eval=getattr(args, "rl_n_paths_eval", 0),
+        rl_epochs=getattr(args, "rl_epochs", 0),
+        steps_per_epoch=getattr(args, "rl_steps_per_epoch", 0),
+        lr=getattr(args, "lr", 3e-4),
+        gae_lambda=getattr(args, "gae_lambda", 0.95),
+        entropy_coef=getattr(args, "entropy_coef", 0.0),
+        value_coef=getattr(args, "value_coef", 0.5),
+        max_grad_norm=getattr(args, "max_grad_norm", 0.5),
     )
+
+    metrics = {
+        "EW": fields.get("EW"),
+        "ES95": fields.get("ES95"),
+        "Ruin": fields.get("Ruin"),
+        "mean_WT": fields.get("mean_WT"),
+    }
+
+    eval_mode = getattr(args, "es_mode", "wealth")
+    n_paths = int(getattr(args, "rl_n_paths_eval", 0)) * len(getattr(args, "seeds", []))
 
     out = dict(
         asset=cfg.asset,
@@ -200,8 +219,13 @@ def run_rl(args):
         lambda_term=cfg.lambda_term,
         alpha=cfg.alpha,
         F_target=cfg.F_target,
-        es_mode="loss",  # 필요 시 args.es_mode로 바꿀 수 있음
+        es_mode=getattr(args, "es_mode", "wealth"),
         n_paths=args.rl_n_paths_eval * len(args.seeds),
         args=slim_args(args),
     )
+
+    # RL도 autosave 동일 적용
+    if str(getattr(args, "autosave", "off")).lower() == "on":
+        do_autosave(metrics, cfg, args, out)
+
     return out

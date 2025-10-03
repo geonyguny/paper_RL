@@ -5,7 +5,7 @@ import argparse
 import json
 import os
 import re
-from typing import Optional
+from typing import Optional, Any, Dict, Tuple
 
 from ..config import (
     CVAR_TARGET_DEFAULT,
@@ -15,6 +15,15 @@ from ..config import (
 )
 from .run import run_once, run_rl
 from .calibrate import calibrate_lambda
+
+# evaluate 위치가 프로젝트마다 다를 수 있어 유연하게 import 시도
+try:  # 권장 경로
+    from .evaluate import evaluate  # type: ignore
+except Exception:
+    try:  # 대안 경로
+        from .eval import evaluate  # type: ignore
+    except Exception:
+        evaluate = None  # evaluate가 없으면 런타임에 dict 반환만 신뢰
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -178,6 +187,51 @@ def _validate_args(args: argparse.Namespace) -> None:
             )
 
 
+def _maybe_evaluate_with_es_mode(
+    res: Any,
+    es_mode: str,
+) -> Dict[str, Any]:
+    """
+    run_once/run_rl 결과가 dict면 그대로,
+    (cfg, actor) 형태면 evaluate(cfg, actor, es_mode=...)를 호출해 metrics dict로 변환.
+    evaluate를 import하지 못한 경우엔 가능한 정보를 dict로 래핑.
+    """
+    # 이미 최종 아웃풋(dict)인 경우 그대로 반환
+    if isinstance(res, dict):
+        # 기록 상 es_mode가 누락/불일치하면 표시만 보정
+        if "es_mode" not in res:
+            res["es_mode"] = es_mode
+        return res
+
+    # evaluate 사용 가능한 경우만 처리
+    if evaluate is not None:
+        # (cfg, actor) or 객체 형태 유연 처리
+        cfg: Optional[Any] = None
+        actor: Optional[Any] = None
+
+        if isinstance(res, tuple) and len(res) >= 2:
+            cfg, actor = res[0], res[1]
+        else:
+            # res가 네임드 객체라면 속성 추출 시도
+            cfg = getattr(res, "cfg", None)
+            actor = getattr(res, "actor", None)
+
+        if cfg is not None and actor is not None:
+            metrics = evaluate(cfg, actor, es_mode=str(es_mode).lower())
+            # evaluate가 metrics dict를 반환한다고 가정
+            if isinstance(metrics, dict):
+                if "es_mode" not in metrics:
+                    metrics["es_mode"] = str(es_mode).lower()
+                return metrics
+
+    # 여기까지 왔다면 evaluate를 못 쓰는 상황 -> 정보 보존용 래핑
+    return {
+        "result": "ok",
+        "note": "evaluate not executed in cli (no evaluate import or unexpected return type).",
+        "es_mode": str(es_mode).lower(),
+    }
+
+
 # --------------------------
 # Main
 # --------------------------
@@ -192,11 +246,16 @@ def main():
 
     # Route by method
     if args.method == "rl":
-        out = run_rl(args)
+        res = run_rl(args)
+        out = _maybe_evaluate_with_es_mode(res, es_mode=getattr(args, "es_mode", "wealth"))
     elif args.method == "hjb" and (args.cvar_target is not None):
         out = calibrate_lambda(args)
+        # 보정: HJB 경로도 출력 dict에 es_mode 표기 일관화
+        if isinstance(out, dict) and "es_mode" not in out:
+            out["es_mode"] = str(getattr(args, "es_mode", "wealth")).lower()
     else:
-        out = run_once(args)
+        res = run_once(args)
+        out = _maybe_evaluate_with_es_mode(res, es_mode=getattr(args, "es_mode", "wealth"))
 
     print(json.dumps(out, ensure_ascii=False))
 
