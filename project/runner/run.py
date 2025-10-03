@@ -150,14 +150,7 @@ def run_once(args) -> Dict[str, Any]:
     return out
 
 
-def run_rl(args) -> Dict[str, Any]:
-    """
-    RL 학습 러너:
-    - cfg 구성 및 실데이터 연결
-    - (선택) 연금 오버레이 주입
-    - A2C 학습 후 요약 메트릭 반환
-    - es_mode 출력은 인자(args.es_mode)를 그대로 반영
-    """
+def run_rl(args):
     # RL도 동일하게 cfg 주입 → trainer 내부 Env 생성 시 실데이터 사용
     cfg: SimConfig = make_cfg(args)
     ensure_dir(args.outputs)
@@ -180,29 +173,26 @@ def run_rl(args) -> Dict[str, Any]:
     except Exception as e:
         raise SystemExit(f"RL trainer import failed: {e}")
 
-    fields: Dict[str, Any] = train_rl(
+    fields = train_rl(
         cfg,
-        seed_list=getattr(args, "seeds", []),
+        seed_list=args.seeds,
         outputs=args.outputs,
-        n_paths_eval=getattr(args, "rl_n_paths_eval", 0),
-        rl_epochs=getattr(args, "rl_epochs", 0),
-        steps_per_epoch=getattr(args, "rl_steps_per_epoch", 0),
-        lr=getattr(args, "lr", 3e-4),
-        gae_lambda=getattr(args, "gae_lambda", 0.95),
-        entropy_coef=getattr(args, "entropy_coef", 0.0),
-        value_coef=getattr(args, "value_coef", 0.5),
-        max_grad_norm=getattr(args, "max_grad_norm", 0.5),
+        n_paths_eval=args.rl_n_paths_eval,
+        rl_epochs=args.rl_epochs,
+        steps_per_epoch=args.rl_steps_per_epoch,
+        lr=args.lr, gae_lambda=args.gae_lambda,
+        entropy_coef=args.entropy_coef, value_coef=args.value_coef,
+        max_grad_norm=args.max_grad_norm,
     )
 
-    metrics = {
-        "EW": fields.get("EW"),
-        "ES95": fields.get("ES95"),
-        "Ruin": fields.get("Ruin"),
-        "mean_WT": fields.get("mean_WT"),
-    }
+    # trainer가 선택적으로 반환할 수 있는 확장 필드들(없으면 None)
+    best_epoch   = fields.get("best_epoch")
+    ckpt_path    = fields.get("ckpt_path")   # 예: outputs/<tag>/policy.pt
+    train_time_s = fields.get("train_time_s")
+    eval_time_s  = fields.get("eval_time_s")
 
-    eval_mode = getattr(args, "es_mode", "wealth")
-    n_paths = int(getattr(args, "rl_n_paths_eval", 0)) * len(getattr(args, "seeds", []))
+    # 총 평가 경로 수(= rl_n_paths_eval × seeds 수)
+    n_paths_total = int(getattr(args, "rl_n_paths_eval", 0)) * len(getattr(args, "seeds", []))
 
     out = dict(
         asset=cfg.asset,
@@ -213,6 +203,10 @@ def run_rl(args) -> Dict[str, Any]:
             "ES95": fields.get("ES95"),
             "Ruin": fields.get("Ruin"),
             "mean_WT": fields.get("mean_WT"),
+            # ← 확장: 디버깅/재현을 위한 유용한 러닝 메타
+            "best_epoch": best_epoch,
+            "train_time_s": train_time_s,
+            "eval_time_s": eval_time_s,
         },
         w_max=cfg.w_max,
         fee_annual=getattr(cfg, "phi_adval", getattr(cfg, "fee_annual", None)),
@@ -220,12 +214,22 @@ def run_rl(args) -> Dict[str, Any]:
         alpha=cfg.alpha,
         F_target=cfg.F_target,
         es_mode=getattr(args, "es_mode", "wealth"),
-        n_paths=args.rl_n_paths_eval * len(args.seeds),
-        args=slim_args(args),
+        n_paths=n_paths_total,
+        args=slim_args(args) | {
+            # 결과 재현을 위해 args에도 몇 가지 핵심 하이퍼 명시
+            "rl_q_cap": getattr(args, "rl_q_cap", None),
+            "teacher_eps0": getattr(args, "teacher_eps0", None),
+            "teacher_decay": getattr(args, "teacher_decay", None),
+            "survive_bonus": getattr(args, "survive_bonus", None),
+            "u_scale": getattr(args, "u_scale", None),
+            "lw_scale": getattr(args, "lw_scale", None),
+            "tag": getattr(args, "tag", None),
+        },
+        ckpt_path=ckpt_path,
     )
 
     # RL도 autosave 동일 적용
-    if str(getattr(args, "autosave", "off")).lower() == "on":
-        do_autosave(metrics, cfg, args, out)
+    if getattr(args, "autosave", "off") == "on":
+        do_autosave(out.get("metrics") or {}, cfg, args, out)
 
     return out
