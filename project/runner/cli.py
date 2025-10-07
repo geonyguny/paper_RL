@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import math
 from typing import Optional, Any, Dict, Iterable
 
 from ..config import (
@@ -43,14 +44,30 @@ except Exception:
 
 
 def _cvar_fallback(losses: Iterable[float], alpha: float) -> float:
-    """metrics_utils 없을 때 간단 CVaR_α 계산 (mean of tail beyond VaR_α)."""
+    """보간 포함 CVaR_α (Acerbi–Tasche 표본식).
+    손실 L_(1) <= ... <= L_(n)에 대해
+      j = floor(n*α), θ = n*α - j
+      ES = ((1-θ)*L_(j+1) + sum_{i=j+2}^n L_(i)) / (n*(1-α))
+    """
     import numpy as np
     L = np.asarray(list(losses), dtype=float)
-    if L.size == 0:
+    n = L.size
+    if n == 0:
         return 0.0
-    q = float(np.quantile(L, alpha))
-    tail = L[L >= q]
-    return float(tail.mean()) if tail.size > 0 else q
+
+    a = float(alpha)
+    # 안전 가드: 0 < α < 1
+    a = max(min(a, 1.0 - 1e-12), 1e-12)
+
+    L.sort()                     # 오름차순
+    j = int(math.floor(n * a))   # 0-베이스 index
+    if j >= n:
+        j = n - 1
+    theta = n * a - j            # [0,1)
+    Lj1 = float(L[j])            # L_(j+1)
+    tail_sum = float(L[j + 1 :].sum())  # L_(j+2) .. L_(n)
+    ES = ((1.0 - theta) * Lj1 + tail_sum) / (n * (1.0 - a))
+    return float(ES)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -63,7 +80,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--w_max", type=float, default=0.70)
     p.add_argument("--fee_annual", type=float, default=0.004)
     p.add_argument("--horizon_years", type=int, default=35)
-    p.add_argument("--alpha", type=float, default=0.95)
+    p.add_argument("--alpha", type=float, default=0.95)  # CVaR level
     p.add_argument("--lambda_term", type=float, default=0.0)
     p.add_argument("--F_target", type=float, default=0.0)
     p.add_argument("--p_annual", type=float, default=0.04)
@@ -81,7 +98,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--hjb_Nshock", type=int, default=None)
     p.add_argument("--hjb_eta_n", type=int, default=None)
 
-    # Hedge
+    # Hedge (legacy)
     p.add_argument("--hedge", choices=["on", "off"], default="off")
     p.add_argument("--hedge_mode", choices=["mu", "sigma", "downside"], default="sigma")
     p.add_argument("--hedge_cost", type=float, default=0.005)
@@ -163,6 +180,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="market_csv 미지정 시 프로파일(dev/full)로 자동 설정")
     p.add_argument("--tag", type=str, default=None,
                    help="실험 태그(로그/metrics에 기록)")
+
+    # === NEW === 자산배분 & 환헤지 옵션 (run.py가 읽어 처리)
+    p.add_argument("--alpha_mix", type=str, default=None,
+                   help="자산배분 α=(KR,US,Au). 예: 'equal' 또는 '0.33,0.33,0.34'")
+    p.add_argument("--alpha_kr", type=float, default=None, help="KR 가중치(개별 지정 시)")
+    p.add_argument("--alpha_us", type=float, default=None, help="US 가중치(개별 지정 시)")
+    p.add_argument("--alpha_au", type=float, default=None, help="Gold 가중치(개별 지정 시)")
+    p.add_argument("--h_FX", type=float, default=None,
+                   help="US 주식 환헤지 비율 h∈[0,1] (예: 1=전헤지)")
+    p.add_argument("--fx_hedge_cost", type=float, default=None,
+                   help="연 환헤지 비용(기본 0.002=0.2%)")
+
+    # --- NEW: 표준출력 제어 ---
+    p.add_argument("--print_mode", choices=["full", "metrics", "summary"], default="full",
+                   help="stdout 출력 형태: full(원본), metrics(선택 지표만), summary(요약)")
+    p.add_argument("--metrics_keys", type=str, default="EW,ES95,Ruin,mean_WT,es_mode",
+                   help="print_mode=metrics|summary 에서 노출할 metrics 키(콤마구분)")
+    p.add_argument("--no_paths", action="store_true",
+                   help="stdout에서 extra.eval_WT/ruin_flags 등 대용량 배열 제거(길이만 남김)")
+
     p.add_argument("--return_actor", choices=["on", "off"], default="off",
                    help="on이면 run_rl이 (cfg, actor)를 반환하고 CLI가 재평가(CVaR 재계산) 수행")
     return p
@@ -282,7 +319,7 @@ def _fixup_metrics_with_cvar(args: argparse.Namespace, out: Dict[str, Any]) -> D
 
         EW = float(metrics.get("EW", 0.0))
         if EW == 0.0:
-            EW = float(metrics.get("mean_WT", 0.0) or np.mean(WT_arr))
+            EW = float(metrics.get("mean_WT", 0.0) or float(np.mean(WT_arr)))
         metrics["EW"] = EW
         metrics["mean_WT"] = EW
         metrics["ES95"] = float(ES)
@@ -298,9 +335,105 @@ def _fixup_metrics_with_cvar(args: argparse.Namespace, out: Dict[str, Any]) -> D
     return out
 
 
+# --- n_paths 추정 (결과에 없을 때) ---
+def _estimate_n_paths(args: argparse.Namespace, out: Dict[str, Any]) -> Optional[int]:
+    try:
+        if isinstance(out, dict):
+            np_exist = out.get("n_paths")
+            if isinstance(np_exist, (int, float)) and int(np_exist) > 0:
+                return int(np_exist)
+        # seeds 처리
+        seeds = getattr(args, "seeds", [])
+        if isinstance(seeds, int):
+            n_seeds = 1
+        elif isinstance(seeds, (list, tuple)):
+            n_seeds = max(1, len(seeds))
+        else:
+            n_seeds = 1
+        # 방법별 평가 경로
+        if str(getattr(args, "method", "hjb")).lower() == "rl":
+            n_eval = int(getattr(args, "rl_n_paths_eval", 0) or 0)
+            if n_eval > 0:
+                return n_eval * n_seeds
+        # 기본 경로
+        n_base = int(getattr(args, "n_paths", 0) or 0)
+        if n_base > 0:
+            return n_base * n_seeds
+    except Exception:
+        pass
+    return None
+
+
+# --- 표준출력 축소/요약 도우미 ---
+def _prune_for_stdout(args: argparse.Namespace, out: Dict[str, Any]) -> Any:
+    def _sel_metrics(md: Dict[str, Any], keys: Iterable[str]) -> Dict[str, Any]:
+        return {k: md[k] for k in keys if k in md}
+
+    # 대용량 경로 제거 옵션
+    if args.no_paths and isinstance(out, dict):
+        out = dict(out)  # shallow copy
+        extra = out.get("extra")
+        if isinstance(extra, dict):
+            for k in ("eval_WT", "ruin_flags"):
+                if k in extra and isinstance(extra[k], (list, tuple)):
+                    try:
+                        extra[k + "_n"] = len(extra[k])
+                    except Exception:
+                        pass
+                    del extra[k]
+            out["extra"] = extra
+
+    mode = getattr(args, "print_mode", "full")
+    if mode == "full":
+        return out
+
+    # metrics 사전 찾기
+    metrics = out["metrics"] if isinstance(out, dict) and isinstance(out.get("metrics"), dict) else out
+    keys = [s.strip() for s in str(getattr(args, "metrics_keys", "")).split(",") if s.strip()]
+
+    # 공통 메타 필드 추정
+    n_paths_guess = _estimate_n_paths(args, out)
+    age0_guess = None
+    sex_guess = None
+    try:
+        if isinstance(out, dict):
+            age0_guess = out.get("age0")
+            sex_guess = out.get("sex")
+        if age0_guess is None:
+            age0_guess = getattr(args, "age0", None)
+        if sex_guess is None:
+            sex_guess = getattr(args, "sex", None)
+    except Exception:
+        pass
+
+    if mode == "metrics":
+        mini = _sel_metrics(metrics, keys)
+        mini.update({
+            "tag": out.get("tag") if isinstance(out, dict) else None,
+            "asset": out.get("asset") if isinstance(out, dict) else None,
+            "method": out.get("method") if isinstance(out, dict) else None,
+            "n_paths": n_paths_guess,
+        })
+        return mini
+
+    if mode == "summary":
+        args_dict = out.get("args", {}) if isinstance(out, dict) else {}
+        return {
+            "tag": out.get("tag") if isinstance(out, dict) else None,
+            "asset": out.get("asset") if isinstance(out, dict) else None,
+            "method": out.get("method") if isinstance(out, dict) else None,
+            "age0": age0_guess if age0_guess is not None else (args_dict or {}).get("age0"),
+            "sex": sex_guess if sex_guess is not None else (args_dict or {}).get("sex"),
+            "metrics": _sel_metrics(metrics, keys),
+            "n_paths": n_paths_guess,
+            "T": (out.get("extra") or {}).get("T") if isinstance(out, dict) else None,
+        }
+
+    return out  # 안전망
+
+
 def _maybe_evaluate_with_es_mode(res: Any, es_mode: str) -> Dict[str, Any]:
-    """
-    run_* 결과가 dict면 그대로 사용.
+    """run_* 결과가 dict면 그대로 사용.
     (cfg, actor) 형태면 evaluate(cfg, actor, es_mode=...) 호출 → dict로 변환.
     """
     # 이미 최종 dict
@@ -389,7 +522,9 @@ def main():
         except Exception:
             pass
 
-    print(json.dumps(out, ensure_ascii=False))
+    # 표준출력 제어 적용
+    to_print = _prune_for_stdout(args, out) if isinstance(out, dict) else out
+    print(json.dumps(to_print, ensure_ascii=False))
 
 
 if __name__ == "__main__":
