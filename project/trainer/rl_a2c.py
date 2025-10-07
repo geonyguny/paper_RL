@@ -1,6 +1,7 @@
 # project/trainer/rl_a2c.py
-import time, csv, math, os, random
+import time, csv, math, os, random, contextlib
 from pathlib import Path
+from typing import Any, Dict, Callable, Optional, Tuple
 
 import numpy as np
 import torch
@@ -8,12 +9,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Beta
+
 from project.env import RetirementEnv
 
 try:
     torch.set_num_threads(1); torch.set_num_interop_threads(1)
 except Exception:
     pass
+
 
 # ---------- Gym-like shim ----------
 class _GymShim:
@@ -32,9 +35,11 @@ class _GymShim:
         return np.asarray(s, dtype=np.float32)
 
     def reset(self, seed=None):
-        try: out = self.base.reset(seed=seed)
-        except TypeError: out = self.base.reset()
-        s = out[0] if (isinstance(out, tuple) and len(out)>=1) else out
+        try:
+            out = self.base.reset(seed=seed)
+        except TypeError:
+            out = self.base.reset()
+        s = out[0] if (isinstance(out, tuple) and len(out) >= 1) else out
         return self._obs_vec(s), {}
 
     def step(self, action):
@@ -42,10 +47,10 @@ class _GymShim:
         out = self.base.step(q, w)
         if not isinstance(out, tuple):
             raise RuntimeError("RetirementEnv.step must return a tuple")
-        if len(out)==5:
+        if len(out) == 5:
             s_next, r, done, trunc, info = out
-        elif len(out)==4:
-            s_next, r, done, info = out; trunc=False
+        elif len(out) == 4:
+            s_next, r, done, info = out; trunc = False
         else:
             raise RuntimeError(f"Unexpected step() return length: {len(out)}")
         obs = self._obs_vec(s_next)
@@ -58,7 +63,9 @@ class _GymShim:
         return obs, float(r), bool(done), bool(trunc), info
 
     def close(self):
-        if hasattr(self.base, "close"): self.base.close()
+        if hasattr(self.base, "close"):
+            self.base.close()
+
 
 # ---------- Utility ----------
 def u_crra(c: float, gamma: float = 3.0, eps: float = 1e-8) -> float:
@@ -66,6 +73,7 @@ def u_crra(c: float, gamma: float = 3.0, eps: float = 1e-8) -> float:
     if abs(gamma - 1.0) < 1e-9:
         return math.log(c)
     return (c ** (1.0 - gamma) - 1.0) / (1.0 - gamma)
+
 
 # ---------- Policy ----------
 class BetaHead(nn.Module):
@@ -75,10 +83,12 @@ class BetaHead(nn.Module):
         self.fc_b = nn.Linear(in_dim, 1)
         nn.init.xavier_uniform_(self.fc_a.weight); nn.init.zeros_(self.fc_a.bias)
         nn.init.xavier_uniform_(self.fc_b.weight); nn.init.zeros_(self.fc_b.bias)
+
     def forward(self, h):
         alpha = F.softplus(self.fc_a(h)) + 1.001
         beta  = F.softplus(self.fc_b(h)) + 1.001
         return alpha, beta
+
 
 class PolicyNet(nn.Module):
     def __init__(self, obs_dim, hidden=128):
@@ -91,12 +101,14 @@ class PolicyNet(nn.Module):
         self.head_w = BetaHead(hidden)
         self.v_head  = nn.Linear(hidden, 1)
         nn.init.xavier_uniform_(self.v_head.weight); nn.init.zeros_(self.v_head.bias)
+
     def forward(self, obs):
         h = self.backbone(obs)
         a_q, b_q = self.head_q(h)
         a_w, b_w = self.head_w(h)
         v = self.v_head(h).squeeze(-1)
         return (a_q, b_q), (a_w, b_w), v
+
     def act(self, obs, cfg, eval_mode=False):
         (a_q, b_q), (a_w, b_w), v = self.forward(obs)
         dist_q = Beta(a_q, b_q); dist_w = Beta(a_w, b_w)
@@ -123,6 +135,7 @@ class PolicyNet(nn.Module):
         ent  = dist_q.entropy().squeeze(-1) + dist_w.entropy().squeeze(-1)
         return q.squeeze(-1), w.squeeze(-1), logp.squeeze(-1), ent, v, (dist_q, dist_w)
 
+
 # ---------- GAE ----------
 def compute_gae(rews, vals, dones, gamma, lam):
     T = len(rews)
@@ -136,6 +149,7 @@ def compute_gae(rews, vals, dones, gamma, lam):
     ret = adv + vals[:T]
     return adv, ret
 
+
 # ---------- Dual CVaR ----------
 class DualCVaR:
     def __init__(self, alpha=0.95, eta_init=0.0, tau=0.3):
@@ -146,18 +160,19 @@ class DualCVaR:
     def terminal_penalty(self, L):
         return self.eta + max(L - self.eta, 0.0) / (1.0 - self.alpha)
 
+
 # ---------- Dual CVaR (stage-wise for consumption shortfall) ----------
 class DualCVaRStage:
     def __init__(self, alpha=0.95, eta_init=0.0, tau=0.3):
         self.alpha = alpha; self.eta = eta_init; self.tau = tau
     def update_eta_with_batch(self, Ls):
-        # Ls: list or np.ndarray of per-step shortfall losses
         if len(Ls) == 0:
             return
         q_alpha = np.quantile(Ls, self.alpha)
         self.eta = (1.0 - self.tau) * self.eta + self.tau * float(q_alpha)
     def penalty(self, L):
         return self.eta + max(L - self.eta, 0.0) / (1.0 - self.alpha)
+
 
 # ---------- Teacher policy ----------
 def teacher_action(cfg):
@@ -171,10 +186,11 @@ def teacher_action(cfg):
     q_teacher = max(q_teacher, q_floor)
     return float(q_teacher), float(w_teacher)
 
+
 # ---------- Rollout ----------
 def rollout(env, policy, cfg, steps, gamma, lam, device,
             cvar_hook, lw_scale, survive_bonus, teacher_eps,
-            stage_cvar: DualCVaRStage = None, cstar_mode: str = "annuity"):
+            stage_cvar: Optional[DualCVaRStage] = None, cstar_mode: str = "annuity"):
     obs_list, act_q, act_w, logp_list, ent_list, val_list, rew_list, done_list = ([] for _ in range(8))
     stage_L_list = []  # for stage-wise CVaR eta update
     obs, _ = env.reset(seed=None)
@@ -222,13 +238,11 @@ def rollout(env, policy, cfg, steps, gamma, lam, device,
                 c_star = float(getattr(cfg, "cstar_m", 0.04/12)) * 1.0  # wealth-normalized obs에서 1.0은 W0
                 c_star = float(c_star) * float(obs[1])  # obs[1]=W/W0
             elif mode == "vpw":
-                # very light VPW proxy: use cfg.monthly annuity factor at starting g
                 m = cfg.monthly(); g = m['g_m']; Nm = env.base.T - env.base.t
                 a = (1.0 - (1.0+g)**(-Nm))/g if g > 0 else max(Nm, 1)
                 q_m = min(1.0, 1.0 / a)
                 c_star = q_m * float(obs[1])  # wealth-normalized
             else:
-                # annuity-style: p_m * W_t
                 c_star = float(cfg.monthly()['p_m']) * float(obs[1])
             L_t = max(c_star - float(c_t), 0.0)
             stage_L_list.append(L_t)
@@ -244,8 +258,6 @@ def rollout(env, policy, cfg, steps, gamma, lam, device,
             lw = float(getattr(cfg, "lw_scale", 0.0) or 0.0)
             if lw != 0.0:
                 rew += lw * float(info.get("W_T", 0.0))
-            # (optional) bequest at death is already included only if user shapes it here
-            # ex) rew += bequest_weight * info.get("bequest", 0.0)
 
         # keep graph
         obs_list.append(obs_t.squeeze(0))
@@ -266,12 +278,17 @@ def rollout(env, policy, cfg, steps, gamma, lam, device,
     rews  = torch.stack(rew_list)
     dones = torch.tensor(done_list, device=device, dtype=torch.bool)
     adv, ret = compute_gae(rews, val, dones, gamma, lam)
-    return {"obs": obs_t, "q": torch.stack(act_q), "w": torch.stack(act_w),
-            "logp": logp, "ent": ent, "val": val, "adv": adv.detach(), "ret": ret.detach(),
-            "stage_L": np.asarray(stage_L_list, dtype=np.float64)}
+    return {
+        "obs": obs_t,
+        "q": torch.stack(act_q), "w": torch.stack(act_w),
+        "logp": logp, "ent": ent, "val": val,
+        "adv": adv.detach(), "ret": ret.detach(),
+        "stage_L": np.asarray(stage_L_list, dtype=np.float64),
+    }
 
-# ---------- Eval (mean-policy) ----------
-def evaluate_mean_policy(make_env_fn, policy, cfg, n_paths=300, device="cpu"):
+
+# ---------- Mean-policy eval (returns W_T) ----------
+def evaluate_mean_policy(make_env_fn, policy, cfg, n_paths=300, device="cpu") -> Dict[str, Any]:
     Ws = []
     with torch.no_grad():
         for _ in range(n_paths):
@@ -283,15 +300,20 @@ def evaluate_mean_policy(make_env_fn, policy, cfg, n_paths=300, device="cpu"):
                 q, w, _, _, _, _ = policy.act(obs_t, cfg, eval_mode=True)
                 obs, r, done, trunc, info = env.step(np.array([float(q.item()), float(w.item())], dtype=np.float32))
             W_T = info.get("W_T", None)
-            if W_T is None and hasattr(env, "W"): W_T = float(env.W)
+            if W_T is None and hasattr(env, "W"):
+                W_T = float(env.W)
             Ws.append(float(W_T)); env.close()
     Ws = np.array(Ws, dtype=np.float64)
     EW = float(Ws.mean())
-    k = max(1, int(0.05 * len(Ws)))
-    tail_idx = np.argsort(Ws)[:k]
-    ES95_loss = float(np.mean(np.maximum(getattr(cfg, "F_target", 1.0) - Ws[tail_idx], 0.0)))
-    Ruin = float((Ws < 1e-9).mean())
-    return {"EW": EW, "ES95": ES95_loss, "Ruin": Ruin, "mean_WT": float(Ws.mean())}
+    # loss tail (CVaR on loss) at alpha=0.95
+    F_t = float(getattr(cfg, "F_target", 1.0) or 1.0)
+    L = np.maximum(F_t - Ws, 0.0)
+    k = max(1, int(0.05 * len(L)))
+    tail_idx = np.argsort(L)[-k:]
+    ES95_loss = float(np.mean(L[tail_idx]))
+    Ruin = float((Ws <= 0.0).mean())
+    return {"EW": EW, "ES95": ES95_loss, "Ruin": Ruin, "mean_WT": EW, "eval_WT": Ws.tolist()}
+
 
 # ---------- XAI helpers ----------
 def make_policy_heatmaps(policy, cfg, outputs, device="cpu"):
@@ -319,6 +341,7 @@ def make_policy_heatmaps(policy, cfg, outputs, device="cpu"):
         plt.tight_layout()
         plt.savefig(out / name); plt.close()
 
+
 def collect_occupancy(make_env_fn, policy, cfg, outputs, n_paths=300, device="cpu"):
     import matplotlib.pyplot as plt
     out = Path(outputs) / "xai"; out.mkdir(parents=True, exist_ok=True)
@@ -341,6 +364,7 @@ def collect_occupancy(make_env_fn, policy, cfg, outputs, n_paths=300, device="cp
     plt.imshow(hist, aspect="auto", origin="lower")
     plt.colorbar(); plt.title("Occupancy (t_norm vs W/W0)")
     plt.tight_layout(); plt.savefig(out / "occupancy.png"); plt.close()
+
 
 def replay_tail_paths(make_env_fn, policy, cfg, outputs, k=8, alpha=0.05, device="cpu"):
     import matplotlib.pyplot as plt
@@ -372,24 +396,79 @@ def replay_tail_paths(make_env_fn, policy, cfg, outputs, k=8, alpha=0.05, device
         plt.figure(); plt.plot(t, ws); plt.title(f"w(t) tail {idx}"); plt.tight_layout()
         plt.savefig(out / f"tail_{idx}_w.png"); plt.close()
 
+
 # ---------- CSV logger ----------
-def append_metrics_csv(outputs_dir, fields):
+def append_metrics_csv(outputs_dir, fields: Dict[str, Any]):
+    """trainer 전용 간단 CSV 로그 (배우/경로 등 비직렬화 필드는 제외)"""
     out_logs = Path(outputs_dir) / "_logs"; out_logs.mkdir(parents=True, exist_ok=True)
     dest = out_logs / "metrics.csv"; write_header = (not dest.exists())
+    # 안전한 필드만 추출
+    safe = {k: v for k, v in fields.items()
+            if isinstance(v, (int, float, str, bool)) or v is None}
     with dest.open("a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields.keys())
-        if write_header: w.writeheader()
-        w.writerow(fields)
+        w = csv.DictWriter(f, fieldnames=safe.keys())
+        if write_header:
+            w.writeheader()
+        w.writerow(safe)
+
+
+# ---------- Actor adapter (policy -> (q,w)) ----------
+def make_actor_from_policy(policy: PolicyNet, cfg: Any, device: str = "cpu") -> Callable[[Dict[str, Any]], Tuple[float, float]]:
+    """evaluate()에서 바로 쓸 수 있는 경량 actor 어댑터
+       ⟶ 정책의 실제 입력차원에 맞춰 obs를 슬라이스/패딩하여 shape mismatch 방지
+    """
+    # 참조 시간/정규화 기준
+    T_ref = int(getattr(cfg, "T", 0) or getattr(cfg, "horizon_years", 35) * getattr(cfg, "steps_per_year", 12))
+    T_ref = max(T_ref, 1)
+    W0 = float(getattr(cfg, "W0", 1.0) or 1.0)
+
+    # 정책의 실제 입력 차원 추론
+    try:
+        in_dim = int(policy.backbone[0].in_features)  # nn.Linear(in_features=...)
+    except Exception:
+        in_dim = 4  # 안전 기본값
+
+    policy = policy.to(device)
+    policy.eval()
+
+    def _build_obs(state: Dict[str, Any]) -> np.ndarray:
+        """정규화된 4D canonical obs를 만든 뒤 정책 in_dim에 맞춰 자르거나 패딩"""
+        try:
+            if "t_norm" in state:
+                t_norm = float(state["t_norm"])
+            else:
+                t_val = float(state.get("t", state.get("age", 0.0)))
+                t_norm = max(0.0, min(1.0, t_val / float(T_ref)))
+            W = float(state.get("W", state.get("W_t", 0.0)))
+            age = float(state.get("age", 65.0))
+            obs4 = np.array([t_norm, W / max(W0, 1e-12), age / 120.0, 0.0], dtype=np.float32)
+        except Exception:
+            obs4 = np.array([0.0, 1.0, 65.0/120.0, 0.0], dtype=np.float32)
+
+        if in_dim <= obs4.shape[0]:
+            return obs4[:in_dim]
+        pad = np.zeros((in_dim - obs4.shape[0],), dtype=np.float32)
+        return np.concatenate([obs4, pad], axis=0)
+
+    @torch.no_grad()
+    def actor(state: Dict[str, Any]) -> Tuple[float, float]:
+        obs = _build_obs(state)
+        q_t, w_t, *_ = policy.act(torch.tensor(obs).unsqueeze(0).to(device), cfg, eval_mode=True)
+        return float(q_t.item()), float(w_t.item())
+
+    return actor
+
 
 # ---------- Entrypoint ----------
 def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_epoch=2048,
              lr=3e-4, gamma=None, gae_lambda=0.95, entropy_coef=0.01, value_coef=0.5,
-             max_grad_norm=0.5, device=None):
+             max_grad_norm=0.5, device=None) -> Dict[str, Any]:
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     gamma = gamma or getattr(cfg, "beta", 0.996)
     random.seed(0); np.random.seed(0); torch.manual_seed(0)
 
-    def _make_env_local(): return _GymShim(RetirementEnv(cfg))
+    def _make_env_local():
+        return _GymShim(RetirementEnv(cfg))
 
     # CVaR dual
     cvar = DualCVaR(alpha=getattr(cfg, "alpha", 0.95), eta_init=0.0, tau=0.3)
@@ -397,9 +476,11 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
     F_target    = float(getattr(cfg, "F_target", 1.0) or 1.0)
 
     def cvar_hook(info):
-        if lambda_term == 0.0: return 0.0
+        if lambda_term == 0.0:
+            return 0.0
         W_T = info.get("W_T", None)
-        if W_T is None: return 0.0
+        if W_T is None:
+            return 0.0
         L = max(F_target - float(W_T), 0.0)
         return - lambda_term * cvar.terminal_penalty(L)
 
@@ -421,6 +502,8 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
     policy = PolicyNet(obs_dim).to(device)
     optim_all = optim.Adam(policy.parameters(), lr=lr)
 
+    train_t0 = time.perf_counter()
+    best_epoch = None  # (optional) keep here if you add model selection
     for epoch in range(rl_epochs):
         eps = teacher_eps0 * (teacher_decay ** epoch)
         batch = rollout(_make_env_local(), policy, cfg, steps_per_epoch, gamma, gae_lambda,
@@ -449,7 +532,8 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
                     q, w, _, _, _, _ = policy.act(obs_t, cfg, eval_mode=True)
                     obs, r, done, trunc, info = env.step(np.array([float(q.item()), float(w.item())], dtype=np.float32))
             W_T = info.get("W_T", None)
-            if W_T is None and hasattr(env, "W"): W_T = float(env.W)
+            if W_T is None and hasattr(env, "W"):
+                W_T = float(env.W)
             Ws_tmp.append(float(W_T)); env.close()
         if lambda_term > 0.0 and len(Ws_tmp) > 0:
             Ls = np.maximum(F_target - np.array(Ws_tmp, dtype=np.float64), 0.0)
@@ -459,10 +543,63 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
         if stage_on and stage_cvar is not None:
             stage_cvar.update_eta_with_batch(batch.get("stage_L", []))
 
-    # evaluation (mean-policy)
-    metrics = evaluate_mean_policy(_make_env_local, policy, cfg, n_paths=n_paths_eval, device=device)
+    train_t1 = time.perf_counter()
 
-    # XAI (optional)
+    # evaluation (mean-policy)
+    eval_t0 = time.perf_counter()
+    metrics_mp = evaluate_mean_policy(_make_env_local, policy, cfg, n_paths=n_paths_eval, device=device)
+    eval_t1 = time.perf_counter()
+
+    # ---- save checkpoint with minimal hints for later evaluation ----
+    ckpt_path = None
+    try:
+        tag = getattr(cfg, "tag", "rl_run") or "rl_run"
+        out_dir = os.path.join(outputs, tag)
+        os.makedirs(out_dir, exist_ok=True)
+        ckpt_path = os.path.join(out_dir, "policy.pt")
+
+        # arch inference from actual module
+        try:
+            first = policy.backbone[0]  # nn.Linear
+            obs_dim_save = int(first.in_features)
+            hidden_save = int(first.out_features)
+        except Exception:
+            obs_dim_save = int(locals().get("obs_dim", 4))
+            hidden_save = 128
+
+        # collect minimal env hints
+        T_hint, W0_hint = 0, 1.0
+        steps_per_year_hint = int(getattr(cfg, "steps_per_year", 12) or 12)
+        horizon_years_hint  = int(getattr(cfg, "horizon_years", 35) or 35)
+
+        _tmp_env = _make_env_local()
+        try:
+            _tmp_env.reset(seed=None)
+            T_hint  = int(getattr(_tmp_env.base, "T", getattr(cfg, "T", 0)) or 0)
+            W0_hint = float(getattr(_tmp_env.base, "W0", getattr(cfg, "W0", 1.0)) or 1.0)
+        finally:
+            with contextlib.suppress(Exception):
+                _tmp_env.close()
+
+        ckpt = {
+            "state_dict": policy.state_dict(),
+            "obs_dim": obs_dim_save,  # legacy-friendly
+            "arch": {"obs_dim": obs_dim_save, "hidden": hidden_save},
+            "cfg_hints": {
+                "q_floor": float(getattr(cfg, "q_floor", 0.0) or 0.0),
+                "w_max":   float(getattr(cfg, "w_max", 1.0) or 1.0),
+                "rl_q_cap":float(getattr(cfg, "rl_q_cap", 0.0) or 0.0),
+                "T": int(T_hint),
+                "W0": float(W0_hint),
+                "steps_per_year": steps_per_year_hint,
+                "horizon_years":  horizon_years_hint,
+            },
+        }
+        torch.save(ckpt, ckpt_path)
+    except Exception:
+        ckpt_path = None  # 저장 실패는 무시
+
+    # XAI (optional, best-effort)
     if bool(getattr(cfg, "xai_on", True)):
         try:
             make_policy_heatmaps(policy, cfg, outputs, device=device)
@@ -471,36 +608,36 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
         except Exception:
             pass
 
+    # fields to append in trainer-local CSV (safe types only)
     ts = time.strftime("%y%m%dT%H%M%S")
-    fields = dict(
+    fields_csv = dict(
         ts=ts, asset=getattr(cfg, "asset", "US"), method="rl", baseline="",
         es_mode="loss", F_target=F_target, w_max=getattr(cfg, "w_max", 1.0),
         hedge_on=getattr(cfg, "hedge_on", False), hedge_mode=getattr(cfg, "hedge_mode", ""),
         hedge_sigma_k=getattr(cfg, "hedge_sigma_k", 0.0), lambda_term=lambda_term,
         fee_annual=getattr(cfg, "phi_adval", 0.0), floor_on=getattr(cfg, "floor_on", False),
-        f_min_real=getattr(cfg, "f_min_real", 0.0), EW=metrics["EW"], ES95=metrics["ES95"],
-        Ruin=metrics["Ruin"], mean_WT=metrics["mean_WT"], seeds=" ".join(map(str, seed_list)),
-        n_paths_eval=n_paths_eval, outputs=str(outputs),
+        f_min_real=getattr(cfg, "f_min_real", 0.0),
+        EW=metrics_mp["EW"], ES95=metrics_mp["ES95"], Ruin=metrics_mp["Ruin"], mean_WT=metrics_mp["mean_WT"],
+        seeds=" ".join(map(str, seed_list)), n_paths_eval=n_paths_eval, outputs=str(outputs),
         mortality_on=getattr(cfg, "mortality_on", False),
         market_mode=getattr(cfg, "market_mode", "iid"),
         cvar_stage_on=getattr(cfg, "cvar_stage_on", False),
     )
-    append_metrics_csv(outputs, fields)
+    append_metrics_csv(outputs, fields_csv)
 
-    # optional XAI 1D slice (t=0, W∈[0.1,2.0]) NPZ
-    out_xai = Path(outputs) / "xai"
-    out_xai.mkdir(parents=True, exist_ok=True)
-    try:
-        W_grid = np.linspace(0.1, 2.0, 121, dtype=np.float32)
-        policy.eval()
-        with torch.no_grad():
-            Pi_q, Pi_w = [], []
-            for wv in W_grid:
-                obs = np.array([0.0, wv, 65.0/120.0, 0.0], dtype=np.float32)
-                q_m, w_m, _, _, _, _ = policy.act(torch.tensor(obs).unsqueeze(0).to(device), cfg, eval_mode=True)
-                Pi_q.append(float(q_m.item())); Pi_w.append(float(w_m.item()))
-        np.savez(str(out_xai / "policy_rl_mean.npz"), Pi_w=np.array(Pi_w), Pi_q=np.array(Pi_q), W_grid=W_grid)
-    except Exception:
-        pass
+    # actor adapter (used by run.py / cli to re-evaluate with rich metrics)
+    actor = make_actor_from_policy(policy, cfg, device=device)
 
-    return fields
+    # final return to runner
+    return {
+        "EW": metrics_mp["EW"],
+        "ES95": metrics_mp["ES95"],
+        "Ruin": metrics_mp["Ruin"],
+        "mean_WT": metrics_mp["mean_WT"],
+        "best_epoch": best_epoch,
+        "train_time_s": float(train_t1 - train_t0),
+        "eval_time_s": float(eval_t1 - eval_t0),
+        "actor": actor,                 # runner가 evaluate(cfg, actor, ...)로 재평가 가능
+        "ckpt_path": ckpt_path,         # 저장 경로 (없으면 None)
+        "eval_WT": metrics_mp.get("eval_WT"),  # 경로별 W_T
+    }

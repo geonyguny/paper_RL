@@ -5,7 +5,7 @@ import argparse
 import json
 import os
 import re
-from typing import Optional, Any, Dict, Tuple
+from typing import Optional, Any, Dict, Iterable
 
 from ..config import (
     CVAR_TARGET_DEFAULT,
@@ -16,14 +16,41 @@ from ..config import (
 from .run import run_once, run_rl
 from .calibrate import calibrate_lambda
 
-# evaluate 위치가 프로젝트마다 다를 수 있어 유연하게 import 시도
-try:  # 권장 경로
-    from .evaluate import evaluate  # type: ignore
+# --- evaluate: 다양한 배치에 대응(절대 경로 우선) ---
+def _import_evaluate():
+    candidates = [
+        "project.runner.evaluate",  # project/runner/evaluate.py
+        "project.evaluate",         # project/evaluate.py
+        "project.runner.eval",      # project/runner/eval.py
+        "project.eval",             # project/eval.py
+    ]
+    for name in candidates:
+        try:
+            mod = __import__(name, fromlist=["evaluate"])
+            return getattr(mod, "evaluate")
+        except Exception:
+            continue
+    return None
+
+evaluate = _import_evaluate()  # type: ignore
+
+# --- CVaR 유틸: 있으면 사용, 없으면 내장 폴백 ---
+try:
+    from ..utils.metrics_utils import terminal_losses, cvar_alpha  # type: ignore
 except Exception:
-    try:  # 대안 경로
-        from .eval import evaluate  # type: ignore
-    except Exception:
-        evaluate = None  # evaluate가 없으면 런타임에 dict 반환만 신뢰
+    terminal_losses = None  # type: ignore
+    cvar_alpha = None       # type: ignore
+
+
+def _cvar_fallback(losses: Iterable[float], alpha: float) -> float:
+    """metrics_utils 없을 때 간단 CVaR_α 계산 (mean of tail beyond VaR_α)."""
+    import numpy as np
+    L = np.asarray(list(losses), dtype=float)
+    if L.size == 0:
+        return 0.0
+    q = float(np.quantile(L, alpha))
+    tail = L[L >= q]
+    return float(tail.mean()) if tail.size > 0 else q
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -127,24 +154,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--ann_d", type=int, default=0)
     p.add_argument("--ann_index", choices=["real", "nominal"], default="real")
 
-    # New: Bands 저장 토글 / 데이터 윈도우 / 프로파일 / 태그
-    p.add_argument(
-        "--bands", choices=["on", "off"], default="on",
-        help="consumption bands 저장(on/off). off면 _bands 파일 미생성",
-    )
-    p.add_argument(
-        "--data_window", type=str, default=None,
-        help="YYYY-MM:YYYY-MM 형식 기간 슬라이스 (예: 2005-01:2020-12)",
-    )
-    p.add_argument(
-        "--data_profile", choices=["dev", "full"], default=None,
-        help="market_csv 미지정 시 기본 CSV 경로를 프로파일로 자동 설정(dev/full)",
-    )
-    p.add_argument(
-        "--tag", type=str, default=None,
-        help="실험 태그(로그/metrics에 기록)",
-    )
-
+    # New: Bands / data window / profile / tag
+    p.add_argument("--bands", choices=["on", "off"], default="on",
+                   help="consumption bands 저장(on/off). off면 _bands 파일 미생성")
+    p.add_argument("--data_window", type=str, default=None,
+                   help="YYYY-MM:YYYY-MM 형식 (예: 2005-01:2020-12)")
+    p.add_argument("--data_profile", choices=["dev", "full"], default=None,
+                   help="market_csv 미지정 시 프로파일(dev/full)로 자동 설정")
+    p.add_argument("--tag", type=str, default=None,
+                   help="실험 태그(로그/metrics에 기록)")
+    p.add_argument("--return_actor", choices=["on", "off"], default="off",
+                   help="on이면 run_rl이 (cfg, actor)를 반환하고 CLI가 재평가(CVaR 재계산) 수행")
     return p
 
 
@@ -156,14 +176,9 @@ _WINDOW_RE = re.compile(r"^\d{4}-\d{2}:\d{4}-\d{2}$")
 
 
 def _apply_data_profile_defaults(args: argparse.Namespace) -> None:
-    """
-    --data_profile 지정 & --market_csv 미지정 시,
-    project/data/market 하위의 기본 CSV 경로를 자동 설정.
-    """
+    """--data_profile 지정 & --market_csv 미지정 시 기본 CSV 경로 자동 설정."""
     if getattr(args, "data_profile", None) and not getattr(args, "market_csv", None):
-        base = os.path.normpath(
-            os.path.join(os.path.dirname(__file__), "..", "data", "market")
-        )
+        base = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "data", "market"))
         if args.data_profile == "dev":
             args.market_csv = os.path.abspath(os.path.join(base, "kr_us_gold_bootstrap_mini.csv"))
         elif args.data_profile == "full":
@@ -171,60 +186,167 @@ def _apply_data_profile_defaults(args: argparse.Namespace) -> None:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
-    # data_window 형식 체크
     if args.data_window is not None:
         s = str(args.data_window).strip()
         if s and not _WINDOW_RE.match(s):
-            raise SystemExit(
-                f"--data_window 형식 오류: '{args.data_window}'. "
-                "예: 2005-01:2020-12"
-            )
-    # bootstrap인데 csv 미지정이면 사용자 친화적 에러
+            raise SystemExit(f"--data_window 형식 오류: '{args.data_window}'. 예: 2005-01:2020-12")
     if args.method in ("hjb", "rule", "rl") and args.market_mode == "bootstrap":
         if not args.market_csv and not args.data_profile:
-            raise SystemExit(
-                "market_mode=bootstrap 사용 시 --market_csv 또는 --data_profile(dev|full) 중 하나는 필수입니다."
-            )
+            raise SystemExit("market_mode=bootstrap 사용 시 --market_csv 또는 --data_profile(dev|full) 필요.")
 
 
-def _maybe_evaluate_with_es_mode(
-    res: Any,
-    es_mode: str,
-) -> Dict[str, Any]:
+# --- 다양한 결과물에서 W_T 추출 ---
+def _maybe_extract_WT(candidate: Any) -> Optional[Iterable[float]]:
+    if candidate is None:
+        return None
+    # numpy array 지원
+    try:
+        import numpy as _np
+        if isinstance(candidate, _np.ndarray):
+            return candidate.tolist()
+    except Exception:
+        pass
+    # list/tuple
+    if isinstance(candidate, (list, tuple)):
+        if len(candidate) >= 2 and isinstance(candidate[1], dict):
+            wt = _maybe_extract_WT(candidate[1])
+            if wt is not None:
+                return wt
+        if candidate and all(isinstance(x, (int, float)) for x in candidate):
+            return candidate  # type: ignore
+    # dict
+    if isinstance(candidate, dict):
+        for k in [
+            "eval_WT", "W_T", "WT", "terminal_wealth", "terminal_wealths",
+            "paths_WT", "wt_paths", "wealth_terminal", "wealth_T",
+        ]:
+            if k in candidate and candidate[k] is not None:
+                return candidate[k]  # type: ignore
+        for k in ["metrics", "extra", "extras", "eval", "payload", "data"]:
+            if k in candidate and isinstance(candidate[k], (dict, list, tuple)):
+                wt = _maybe_extract_WT(candidate[k])
+                if wt is not None:
+                    return wt
+    # attrs
+    for attr in ["eval_WT", "W_T", "WT", "terminal_wealth", "paths_WT", "wealth_T", "terminal_wealths"]:
+        try:
+            wt = getattr(candidate, attr)
+            if wt is not None:
+                return wt  # type: ignore
+        except Exception:
+            pass
+    return None
+
+
+# --- ES95(CVaR) 보정 ---
+def _fixup_metrics_with_cvar(args: argparse.Namespace, out: Dict[str, Any]) -> Dict[str, Any]:
+    # metrics dict 위치 결정
+    metrics = out["metrics"] if "metrics" in out and isinstance(out["metrics"], dict) else out
+    es_mode = str(getattr(args, "es_mode", "wealth")).lower()
+    F_target = float(getattr(args, "F_target", 0.0) or 0.0)
+    alpha_v = float(getattr(args, "alpha", 0.95) or 0.95)
+
+    # wealth 모드에서는 재계산 대상 아님
+    if es_mode != "loss" or F_target <= 0.0:
+        metrics["es_mode"] = es_mode
+        return out
+
+    WT = None
+    for cand in (out, metrics):
+        WT = _maybe_extract_WT(cand)
+        if WT is not None:
+            break
+
+    if WT is None:
+        # 의심 패턴(EW+ES95 ≈ F_target) 감지 시 메시지
+        try:
+            EW = float(metrics.get("EW", 0.0) or metrics.get("mean_WT", 0.0) or 0.0)
+            ES_old = float(metrics.get("ES95", 0.0) or 0.0)
+            if abs((EW + ES_old) - F_target) < 1e-9 and ES_old > 0:
+                metrics["es95_note"] = "ES95 looks like (F_target - EW). No W_T to recompute; please expose path-level W_T from evaluate."
+        except Exception:
+            pass
+        metrics["es_mode"] = es_mode
+        return out
+
+    # CVaR 재계산
+    try:
+        import numpy as np
+        WT_arr = np.asarray(list(WT), dtype=float)
+        if terminal_losses is not None and cvar_alpha is not None:
+            L = terminal_losses(WT_arr, F_target)
+            ES = cvar_alpha(L, alpha=alpha_v)
+        else:
+            L = np.maximum(F_target - WT_arr, 0.0)
+            ES = _cvar_fallback(L, alpha=alpha_v)
+
+        EW = float(metrics.get("EW", 0.0))
+        if EW == 0.0:
+            EW = float(metrics.get("mean_WT", 0.0) or np.mean(WT_arr))
+        metrics["EW"] = EW
+        metrics["mean_WT"] = EW
+        metrics["ES95"] = float(ES)
+        try:
+            metrics["Ruin"] = float((WT_arr <= 0.0).mean())
+        except Exception:
+            pass
+        metrics["es_mode"] = es_mode
+        metrics["es95_source"] = "path_level_cvar"
+    except Exception as e:
+        metrics["es_mode"] = es_mode
+        metrics["es95_note"] = f"failed to recompute ES95: {type(e).__name__}"
+    return out
+
+
+def _maybe_evaluate_with_es_mode(res: Any, es_mode: str) -> Dict[str, Any]:
     """
-    run_once/run_rl 결과가 dict면 그대로,
-    (cfg, actor) 형태면 evaluate(cfg, actor, es_mode=...)를 호출해 metrics dict로 변환.
-    evaluate를 import하지 못한 경우엔 가능한 정보를 dict로 래핑.
+    run_* 결과가 dict면 그대로 사용.
+    (cfg, actor) 형태면 evaluate(cfg, actor, es_mode=...) 호출 → dict로 변환.
     """
-    # 이미 최종 아웃풋(dict)인 경우 그대로 반환
+    # 이미 최종 dict
     if isinstance(res, dict):
-        # 기록 상 es_mode가 누락/불일치하면 표시만 보정
         if "es_mode" not in res:
             res["es_mode"] = es_mode
         return res
 
-    # evaluate 사용 가능한 경우만 처리
+    # evaluate 경로
     if evaluate is not None:
-        # (cfg, actor) or 객체 형태 유연 처리
         cfg: Optional[Any] = None
         actor: Optional[Any] = None
 
         if isinstance(res, tuple) and len(res) >= 2:
             cfg, actor = res[0], res[1]
         else:
-            # res가 네임드 객체라면 속성 추출 시도
             cfg = getattr(res, "cfg", None)
             actor = getattr(res, "actor", None)
 
         if cfg is not None and actor is not None:
-            metrics = evaluate(cfg, actor, es_mode=str(es_mode).lower())
-            # evaluate가 metrics dict를 반환한다고 가정
-            if isinstance(metrics, dict):
-                if "es_mode" not in metrics:
-                    metrics["es_mode"] = str(es_mode).lower()
-                return metrics
+            try:
+                m = evaluate(cfg, actor, es_mode=str(es_mode).lower(), return_paths=True)  # type: ignore
+            except TypeError:
+                m = evaluate(cfg, actor, es_mode=str(es_mode).lower())  # type: ignore
 
-    # 여기까지 왔다면 evaluate를 못 쓰는 상황 -> 정보 보존용 래핑
+            # (metrics, extras) or dict
+            if isinstance(m, tuple) and len(m) >= 1 and isinstance(m[0], dict):
+                pack: Dict[str, Any] = {"metrics": m[0]}
+                if len(m) >= 2:
+                    pack["extra"] = m[1]  # extras['eval_WT'] 등 보관
+                if "es_mode" not in pack["metrics"]:
+                    pack["metrics"]["es_mode"] = str(es_mode).lower()
+                # cfg에서 몇 가지 편의 필드 복사(있을 때만)
+                for k in ("asset", "method", "w_max", "fee_annual", "lambda_term", "alpha", "F_target", "outputs", "tag"):
+                    try:
+                        pack[k] = getattr(cfg, k)
+                    except Exception:
+                        pass
+                return pack
+
+            if isinstance(m, dict):
+                if "es_mode" not in m:
+                    m["es_mode"] = str(es_mode).lower()
+                return m
+
+    # evaluate 사용 불가 → 최소 정보 래핑
     return {
         "result": "ok",
         "note": "evaluate not executed in cli (no evaluate import or unexpected return type).",
@@ -240,22 +362,32 @@ def main():
     p = _build_arg_parser()
     args = p.parse_args()
 
-    # Default market_csv from data_profile when not provided
     _apply_data_profile_defaults(args)
     _validate_args(args)
 
-    # Route by method
+    # route
     if args.method == "rl":
         res = run_rl(args)
         out = _maybe_evaluate_with_es_mode(res, es_mode=getattr(args, "es_mode", "wealth"))
     elif args.method == "hjb" and (args.cvar_target is not None):
         out = calibrate_lambda(args)
-        # 보정: HJB 경로도 출력 dict에 es_mode 표기 일관화
         if isinstance(out, dict) and "es_mode" not in out:
             out["es_mode"] = str(getattr(args, "es_mode", "wealth")).lower()
     else:
         res = run_once(args)
         out = _maybe_evaluate_with_es_mode(res, es_mode=getattr(args, "es_mode", "wealth"))
+
+    # ES95(CVaR) 보정
+    try:
+        if isinstance(out, dict):
+            out = _fixup_metrics_with_cvar(args, out)
+    except Exception as _e:
+        try:
+            if isinstance(out, dict):
+                tgt = out["metrics"] if "metrics" in out and isinstance(out["metrics"], dict) else out
+                tgt["es95_note"] = f"post-fixup failed: {type(_e).__name__}"
+        except Exception:
+            pass
 
     print(json.dumps(out, ensure_ascii=False))
 

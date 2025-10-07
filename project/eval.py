@@ -5,7 +5,7 @@ from __future__ import annotations
 import os, csv, datetime, inspect
 import numpy as _np
 import pandas as pd
-from typing import Callable, Tuple, Optional, Dict, Any
+from typing import Callable, Tuple, Optional, Dict, Any, Union
 
 from .env import RetirementEnv
 
@@ -27,8 +27,10 @@ _METRICS_HEADER: list[str] = [
     "p10_c_last", "p50_c_last", "p90_c_last", "C_ES95_avg", "AlivePathRate",
     # annuity overlay (if present)
     "y_ann", "a_factor", "P",
-    # convenience: sweep/overlay params persisted in logs
+    # sweep/overlay params persisted in logs
     "ann_alpha",
+    # (NEW) diagnostics for ES
+    "es95_source", "es95_note",
 ]
 
 
@@ -37,10 +39,7 @@ _METRICS_HEADER: list[str] = [
 # =========================
 
 def _reset_env(env: RetirementEnv, seed: int) -> None:
-    """
-    reset(seed=...) 지원/미지원 환경 모두에서 안전하게 초기화.
-    우선 reset(seed=...), 폴백으로 reset(), 보조적으로 set_seed(seed) 호출.
-    """
+    """reset(seed=...) 지원/미지원 환경 모두에서 안전하게 초기화."""
     try:
         sig = inspect.signature(env.reset)
         if "seed" in sig.parameters:
@@ -77,10 +76,7 @@ def _get_life_table(env: RetirementEnv) -> Optional[pd.DataFrame]:
 
 
 def _annual_q_from_row(row: pd.Series) -> float:
-    """
-    life_table 한 행에서 annual qx를 안전하게 꺼낸다.
-    허용 컬럼: qx 또는 px/Px(생존확률).
-    """
+    """life_table 한 행에서 annual qx를 안전하게 꺼낸다."""
     if "qx" in row.index:
         q = float(row["qx"])
     elif "px" in row.index or "Px" in row.index:
@@ -106,10 +102,7 @@ def _sample_death_month(
     rng: _np.random.Generator,
     max_extra_years: int = 60,
 ) -> Optional[int]:
-    """
-    생명표 기반 사망월 표본추출.
-    - 반환: death_m (0-based, 해당 달 '이전'에 사망으로 간주) 또는 None(장수)
-    """
+    """생명표 기반 사망월 표본추출. 반환: death_m 또는 None(장수)"""
     if life_df is None or life_df.empty:
         return None
     df = life_df.copy()
@@ -174,8 +167,7 @@ def run_episode(
     hedge_active_w_sum = 0.0
 
     for i in range(env.T):
-        # death reached: stop stepping; use last pre-death wealth as terminal
-        if (death_m is not None) and (i >= death_m):
+        if (death_m is not None) and (i >= death_m):  # death reached: stop
             break
 
         state = env._obs()
@@ -185,7 +177,7 @@ def run_episode(
         W_hist.append(env.W)
         C_hist.append(float((info or {}).get("consumption", 0.0)))
 
-        # ruin (separate from death): W<=0 before last scheduled step
+        # ruin (separate from death)
         if env.W <= 0.0 and i < env.T - 1:
             early_hit = True
 
@@ -213,6 +205,7 @@ def run_episode(
 # =========================
 
 def metrics_wealth(WT_samples: _np.ndarray, alpha: float = 0.95) -> Dict[str, float]:
+    """ES95 = 하위 (1-α) 분위수 이하의 평균(부(-) 꼬리 평균 아님: 자산 관점)."""
     EW = float(WT_samples.mean())
     q = _np.quantile(WT_samples, 1.0 - alpha)  # 5th pct of wealth
     tail = WT_samples[WT_samples <= q]
@@ -221,10 +214,10 @@ def metrics_wealth(WT_samples: _np.ndarray, alpha: float = 0.95) -> Dict[str, fl
 
 
 def metrics_loss(WT_samples: _np.ndarray, F: float = 1.0, alpha: float = 0.95) -> Dict[str, float]:
-    # Loss = shortfall vs target F at terminal
+    """Loss = max(F − W_T, 0). ES95는 손실분포의 α-조건부기대치(CVaR_α)."""
     L = _np.maximum(F - WT_samples, 0.0)
     EL = float(L.mean())
-    qL = _np.quantile(L, alpha)  # 95th pct of loss
+    qL = _np.quantile(L, alpha)      # VaR_α
     tail = L[L >= qL]
     ES = float(tail.mean()) if tail.size > 0 else float(qL)
     return dict(EW=float(WT_samples.mean()), EL=EL, ES95=ES)
@@ -234,11 +227,35 @@ def metrics_loss(WT_samples: _np.ndarray, F: float = 1.0, alpha: float = 0.95) -
 # Evaluation (wealth/loss + consumption bands + mortality)
 # =========================
 
-def evaluate(cfg: Any, actor, es_mode: str = "wealth") -> Dict[str, float]:
+def evaluate(
+    cfg: Any,
+    actor,
+    es_mode: str = "wealth",
+    return_paths: bool = False,
+) -> Union[Dict[str, float], Tuple[Dict[str, float], Dict[str, Any]]]:
+    """
+    Parameters
+    ----------
+    cfg : Any
+    actor : policy callable
+    es_mode : "wealth" | "loss"
+    return_paths : bool
+        True면 (metrics, {"eval_WT": [...]}) 튜플 반환. False면 metrics만 반환.
+
+    Returns
+    -------
+    metrics : dict
+        EW, ES95, EL(손실모드), Ruin, mean_WT, 소비 밴드 등 요약 메트릭
+        + es_mode, es95_source(진단)
+    extras? : dict (optional)
+        eval_WT : list[float]  # 경로별 최종자산 (CLI의 CVaR 재계산에 사용)
+        ruin_flags : list[bool]
+        T : int
+    """
     env = RetirementEnv(cfg)
     T = int(getattr(env, "T", 0))
 
-    # (NEW) verify injected paths snapshot (quiet=off 때만 1회 출력)
+    # (debug) verify injected paths snapshot (quiet=off 때만)
     if str(getattr(cfg, "quiet", "on")).lower() != "on":
         def _cs(a):
             a = _np.asarray(a, dtype=float)
@@ -246,21 +263,17 @@ def evaluate(cfg: Any, actor, es_mode: str = "wealth") -> Dict[str, float]:
         try:
             print(f"[eval] path_cs ret={_cs(getattr(env, 'path_risky', _np.array([], dtype=float))):.6f} "
                   f"rf={_cs(getattr(env, 'path_safe', _np.array([], dtype=float))):.6f}")
-            pr = getattr(env, "path_risky", None)
-            ps = getattr(env, "path_safe", None)
+            pr = getattr(env, "path_risky", None); ps = getattr(env, "path_safe", None)
             if pr is not None and ps is not None:
                 pr = _np.asarray(pr, dtype=float); ps = _np.asarray(ps, dtype=float)
                 if pr.size >= 2 and ps.size >= 2:
                     print(f"[eval] head ret={pr[0]:.6f},{pr[1]:.6f} rf={ps[0]:.6f},{ps[1]:.6f}")
         except Exception:
-            # 디버그 출력 실패는 시뮬레이션에 영향 주지 않음
             pass
 
     WT: list[float] = []
     early_flags: list[bool] = []
-
-    # consumption series (NaN padded to T)
-    C_all: list[_np.ndarray] = []
+    C_all: list[_np.ndarray] = []  # consumption series (NaN padded to T)
 
     # hedge aggregates
     agg_hedge_hits = 0.0
@@ -305,10 +318,13 @@ def evaluate(cfg: Any, actor, es_mode: str = "wealth") -> Dict[str, float]:
             F = float(getattr(cfg, "F_target", 1.0) or 1.0)
             m = metrics_loss(WT_arr, F=F, alpha=float(getattr(cfg, "alpha", 0.95)))
             m["mean_WT"] = float(WT_arr.mean())
+            m["es95_source"] = "computed_in_evaluate_loss"
         else:
             m = metrics_wealth(WT_arr, alpha=float(getattr(cfg, "alpha", 0.95)))
             m["mean_WT"] = m["EW"]
+            m["es95_source"] = "computed_in_evaluate_wealth"
     m["Ruin"] = ruin_rate
+    m["es_mode"] = str(es_mode).lower()
 
     # hedge summary
     m["HedgeHit"] = float(agg_hedge_hits / agg_steps) if agg_steps > 0 else 0.0
@@ -325,20 +341,15 @@ def evaluate(cfg: Any, actor, es_mode: str = "wealth") -> Dict[str, float]:
         alive_rate = float(_np.mean(~_np.all(_np.isnan(C_mat), axis=1)))
         m["AlivePathRate"] = alive_rate
 
-        # (선택) 종료 이후 소비=0으로 간주하려면 다음 라인을 활성화
-        # C_mat = _np.where(_np.isnan(C_mat), 0.0, C_mat)
-
         # 유효 열(전부 NaN이 아닌 시점)만 골라서 밴드 계산
         valid_cols = _np.where(~_np.all(_np.isnan(C_mat), axis=0))[0]
         if valid_cols.size > 0:
             last_idx = int(valid_cols[-1])
 
-            # 유효 구간에 대해서만 백분위 계산
             p10_v = _np.nanpercentile(C_mat[:, valid_cols], 10, axis=0)
             p50_v = _np.nanpercentile(C_mat[:, valid_cols], 50, axis=0)
             p90_v = _np.nanpercentile(C_mat[:, valid_cols], 90, axis=0)
 
-            # 마지막 유효 시점의 last 지표
             m["p10_c_last"] = float(_np.nanpercentile(C_mat[:, last_idx], 10))
             m["p50_c_last"] = float(_np.nanpercentile(C_mat[:, last_idx], 50))
             m["p90_c_last"] = float(_np.nanpercentile(C_mat[:, last_idx], 90))
@@ -359,10 +370,9 @@ def evaluate(cfg: Any, actor, es_mode: str = "wealth") -> Dict[str, float]:
                 }).to_csv(os.path.join(bands_dir, "consumption_bands.csv"),
                          index=False, encoding="utf-8")
         else:
-            # 모든 열이 NaN인 드문 케이스: 보수적으로 0 처리
             m.update({"p10_c_last": 0.0, "p50_c_last": 0.0, "p90_c_last": 0.0, "C_ES95_avg": 0.0})
 
-    # -------- NEW: 분포 진단 프린트 (quiet=off일 때만) --------
+    # (quiet=off) 분포 진단 출력
     if str(getattr(cfg, "quiet", "on")).lower() != "on":
         try:
             wt_std = float(_np.nanstd(WT_arr)) if WT_arr.size > 0 else float("nan")
@@ -371,8 +381,14 @@ def evaluate(cfg: Any, actor, es_mode: str = "wealth") -> Dict[str, float]:
             print(f"[dbg:evaluate] WT_std={wt_std:.6g} WT_min={wt_min:.6g} WT_max={wt_max:.6g} Ruin={m.get('Ruin'):.3f}")
         except Exception:
             pass
-    # ---------------------------------------------------------
 
+    if return_paths:
+        extras: Dict[str, Any] = {
+            "eval_WT": WT_arr.tolist(),
+            "ruin_flags": early_flags,
+            "T": int(T),
+        }
+        return m, extras
     return m
 
 
@@ -390,7 +406,7 @@ def _now_iso() -> str:
 
 def _maybe_upgrade_header(csv_path: str, expected: list[str]) -> None:
     """
-    기존 metrics.csv 헤더가 구버전이면 자동으로 백업 후 최신 헤더로 재작성.
+    기존 metrics.csv 헤더가 구버전이면 자동 백업 후 최신 헤더로 재작성.
     (기존 행은 유지, 새 컬럼은 공란으로 채움)
     """
     try:
@@ -402,12 +418,10 @@ def _maybe_upgrade_header(csv_path: str, expected: list[str]) -> None:
         if current == expected:
             return
 
-        # backup
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         bak = f"{csv_path}.bak_{ts}"
         os.replace(csv_path, bak)
 
-        # rewrite with expected header
         with open(bak, "r", encoding="utf-8", newline="") as fin, \
              open(csv_path, "w", encoding="utf-8", newline="") as fout:
             r = csv.DictReader(fin)
@@ -424,15 +438,13 @@ def _maybe_upgrade_header(csv_path: str, expected: list[str]) -> None:
 def save_metrics_autocsv(metrics: dict, cfg: Any, outputs: Optional[str] = None) -> str:
     """
     outputs/_logs/metrics.csv에 한 줄 append.
-    - 최신 헤더와 다르면 자동으로 마이그레이션 수행(재발 방지).
-    - 소비/연금/보조지표 컬럼 포함 → 논문 표/그림 바로 내보내기.
+    (extras는 파일에 쓰지 않음)
     """
     out_dir = outputs or getattr(cfg, "outputs", "./outputs")
     logs_dir = os.path.join(out_dir, "_logs")
     _ensure_dir(logs_dir)
     csv_path = os.path.join(logs_dir, "metrics.csv")
 
-    # auto-migrate header if needed
     _maybe_upgrade_header(csv_path, _METRICS_HEADER)
 
     method = getattr(cfg, "method", None)
@@ -488,6 +500,9 @@ def save_metrics_autocsv(metrics: dict, cfg: Any, outputs: Optional[str] = None)
         "P": metrics.get("P"),
         # sweep/overlay params
         "ann_alpha": getattr(cfg, "ann_alpha", None),
+        # ES diagnostics
+        "es95_source": metrics.get("es95_source"),
+        "es95_note": metrics.get("es95_note"),
     }
 
     write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
@@ -505,10 +520,7 @@ def save_metrics_autocsv(metrics: dict, cfg: Any, outputs: Optional[str] = None)
 # =========================
 
 def plot_frontier_from_csv(csv_path: str, out_path: Optional[str] = None) -> Optional[str]:
-    """
-    EW–ES95 frontier를 metrics.csv에서 그려 저장.
-    matplotlib 미설치 시 None 반환.
-    """
+    """EW–ES95 frontier를 metrics.csv에서 그려 저장(옵션)."""
     try:
         import csv as _csv
         import matplotlib.pyplot as plt  # optional

@@ -1,33 +1,51 @@
 ﻿# =========================
-# presets.ps1 (refactored, safe metrics loading & no alias conflicts)
+# presets.ps1 (single-file: capmicro/sweepw/esgrid built-in; no alias conflicts)
 # =========================
 # 로드:   . .\presets.ps1
 # 예시:
-#   rs  -Tag "test_run"
-#   scp -Caps 0.005,0.0065,0.007 -Epochs 100
-#   lm  -Top 10
+#   rs   -Tag "test_run"
+#   scp  -Caps 0.005,0.0065,0.007 -Epochs 100
+#   lm   -Top 10
 #   wt
-#   fbt -Like 'sweep_cap*'
-#   bp  -Prefix 'cap_sweep_e80_' -Show
-#   pbs -Prefix 'cap_sweep_e80_' -Epochs 400 -Entropy 0.0012 -Tag 'final_cap_from_sweep'
+#   fbt  -Like 'sweep_cap*'
+#   bp   -Prefix 'cap_sweep_e80_' -Show
+#   pbs  -Prefix 'cap_sweep_e80_' -Epochs 400 -Entropy 0.0012 -Tag 'final_cap_from_sweep'
+#   rpt  -TopN 20 -ESCap 0.35
+#   capmicro -Start 0.0042 -End 0.0048 -Step 0.0001 -Epochs 120 -Entropy 0.0012 -TagPrefix "cap_micro_e120"
+#   sweepw   -Windows "2000-01:2020-12","2005-01:2024-12" -Cap 0.0045 -Epochs 100 -Entropy 0.0012 -TagPrefix "cap005_window"
+#   esgrid   -Cap 0.0045 -Lambdas 0.2,0.4,0.8,1.2 -Epochs 120 -Entropy 0.0012 -TagPrefix "esgrid_term"
+
+# (선택) Windows 기본 alias 'rp' 제거하고 싶다면 상단에서 해제 가능 (우리는 rpt를 사용)
+# if (Get-Alias rp -ErrorAction SilentlyContinue) { Remove-Item alias:rp -Force }
 
 # --- 공통 프리셋 (CLI에 그대로 전달되는 인자 배열) ---
 $COMMON = @(
-  '--asset','US','--market_mode','bootstrap',
+  '--asset','US',
+  '--market_mode','bootstrap',
   '--market_csv','D:\01_simul\project\data\market\kr_us_gold_bootstrap_full.csv',
-  '--data_window','2005-01:2020-12','--use_real_rf','on',
-  '--horizon_years','35','--w_max','0.70','--w_fixed','0.60','--fee_annual','0.004',
+  '--bootstrap_block','24',
+  '--data_window','2005-01:2020-12',
+  '--use_real_rf','on',
+  '--horizon_years','35',
+  '--w_max','0.70',
+  '--w_fixed','0.60',
+  '--fee_annual','0.004',
+  '--alpha','0.95',
+  '--lambda_term','0.0',
   # seeds는 공백 구분 다중 인자로! (쉼표 X)
   '--seeds', 0, 1, 2, 3, 4,
   '--n_paths','120',
-  '--autosave','on','--quiet','off','--bands','on',
+  '--autosave','on',
+  '--quiet','off',
+  '--bands','on',
   '--outputs','.\\outputs\\paper_main'
 )
 
 # --- RL 기본 하이퍼 ---
 $RLBASE = @(
   '--method','rl',
-  '--es_mode','wealth',              # 평가 저장에 반영됨
+  '--es_mode','wealth',
+  '--xai_on','on',
   '--rl_steps_per_epoch','4096',
   '--lr','1e-4',
   '--gae_lambda','0.95',
@@ -58,31 +76,26 @@ function Get-MetricsRows {
     Write-Warning "metrics.csv not found at $METRICS"
     return @()
   }
-  Import-Csv $METRICS |
-    # 최소 유효성: RL 행 & es_mode 존재 & EW 숫자 가능
+  $rows = Import-Csv $METRICS
+
+  # ts 컬럼 없을 시 datetime으로 보완
+  if ($rows.Count -gt 0 -and -not ($rows[0].PSObject.Properties.Name -contains 'ts') -and ($rows[0].PSObject.Properties.Name -contains 'datetime')) {
+    $rows | ForEach-Object { $_ | Add-Member -NotePropertyName ts -NotePropertyValue $_.datetime -Force }
+  }
+
+  $rows |
     Where-Object {
-      $_.method -eq 'rl' -and $_.es_mode -in @('wealth','loss') -and (_ToDouble $_.EW) -ne $null
+      $_.method -eq 'rl' -and $_.es_mode -in @('wealth','loss','term') -and (_ToDouble $_.EW) -ne $null
     } |
-    # 파생 컬럼(정렬/계산용) 추가
-    Select-Object *, @{
-      n='EW_d';   e={ _ToDouble $_.EW }
-    }, @{
-      n='ES95_d'; e={ _ToDouble $_.ES95 }
-    }, @{
-      n='Ruin_d'; e={ _ToDouble $_.Ruin }
-    }
+    Select-Object *, @{n='EW_d';e={ _ToDouble $_.EW }},
+                     @{n='ES95_d';e={ _ToDouble $_.ES95 }},
+                     @{n='Ruin_d';e={ _ToDouble $_.Ruin }}
 }
 
 # -----------------------------
 # 실행기
 # -----------------------------
 function RunSim {
-  <#
-    .SYNOPSIS
-      단일 러닝 실행 (프리셋 + 덮어쓰기)
-    .EXAMPLE
-      RunSim -Tag "cap005_e80" -Epochs 80 -Entropy 0.0012 -Cap 0.005
-  #>
   [CmdletBinding()]
   param(
     [string] $Tag = "ad-hoc",
@@ -102,17 +115,10 @@ function RunSim {
   if ($PSBoundParameters.ContainsKey('DataWindow') -and $DataWindow) {
     $extra += @('--data_window', $DataWindow)
   }
-
   & $PY -m $CLI @COMMON @RLBASE @extra
 }
 
 function SweepCap {
-  <#
-    .SYNOPSIS
-      rl_q_cap 스윕 실행
-    .EXAMPLE
-      SweepCap -Caps 0.005,0.0075,0.01 -Epochs 80 -Entropy 0.0015
-  #>
   [CmdletBinding()]
   param(
     [double[]] $Caps = @(0.005, 0.0075, 0.01),
@@ -133,12 +139,6 @@ function SweepCap {
 # 조회/표시
 # -----------------------------
 function LatestMetrics {
-  <#
-    .SYNOPSIS
-      최근 저장된 metrics.csv 표시
-    .EXAMPLE
-      LatestMetrics -Top 10
-  #>
   [CmdletBinding()]
   param([int] $Top = 10)
 
@@ -148,21 +148,14 @@ function LatestMetrics {
   $rows |
     Sort-Object ts -Descending |
     Select-Object -First $Top |
-    # 표시용: 계산된 *_d가 있으면 그 값을 보여주기
     Select-Object ts, method, es_mode, tag,
-      @{n='EW';   e={ if ($_.EW_d -ne $null) { $_.EW_d } else { $_.EW } }},
+      @{n='EW';   e={ if ($_.EW_d   -ne $null) { $_.EW_d }   else { $_.EW } }},
       @{n='ES95'; e={ if ($_.ES95_d -ne $null) { $_.ES95_d } else { $_.ES95 } }},
       @{n='Ruin'; e={ if ($_.Ruin_d -ne $null) { $_.Ruin_d } else { $_.Ruin } }} |
     Format-Table -AutoSize
 }
 
 function FindByTag {
-  <#
-    .SYNOPSIS
-      metrics.csv에서 tag로 필터링
-    .EXAMPLE
-      FindByTag -Like 'sweep_cap*'
-  #>
   [CmdletBinding()]
   param([string] $Like = '*')
 
@@ -173,17 +166,13 @@ function FindByTag {
     Where-Object { $_.tag -like $Like } |
     Sort-Object ts -Descending |
     Select-Object ts, method, es_mode, tag,
-      @{n='EW';   e={ if ($_.EW_d -ne $null) { $_.EW_d } else { $_.EW } }},
+      @{n='EW';   e={ if ($_.EW_d   -ne $null) { $_.EW_d }   else { $_.EW } }},
       @{n='ES95'; e={ if ($_.ES95_d -ne $null) { $_.ES95_d } else { $_.ES95 } }},
       @{n='Ruin'; e={ if ($_.Ruin_d -ne $null) { $_.Ruin_d } else { $_.Ruin } }} |
     Format-Table -AutoSize
 }
 
 function Warmup {
-  <#
-    .SYNOPSIS
-      1 에폭 워밍업 실행(로그/저장 확인용)
-  #>
   RunSim -Tag "warmup_autosave" -Epochs 1 -Entropy 0.001 -Cap 0.005 -EsMode "wealth"
 }
 
@@ -191,12 +180,6 @@ function Warmup {
 # Best/Promote 유틸
 # -----------------------------
 function BestByPrefix {
-  <#
-    .SYNOPSIS
-      특정 Prefix로 시작하는 tag 중 EW 상위 선택 (cap 복원 포함)
-    .EXAMPLE
-      BestByPrefix -Prefix 'cap_sweep_e80_' -Show
-  #>
   [CmdletBinding()]
   param(
     [string] $Prefix = 'cap_sweep_e80_',
@@ -211,16 +194,9 @@ function BestByPrefix {
   if ($Show) {
     $sorted |
       Select-Object -First 10 -Property ts, tag, @{
-        n='cap'; e={
-          if ($_.tag -match '_(\d{5})$') { ([int]$Matches[1]) / 10000.0 } else { $null }
-        }
-      }, @{
-        n='EW'; e={ $_.EW_d }
-      }, @{
-        n='ES95'; e={ $_.ES95_d }
-      }, @{
-        n='Ruin'; e={ $_.Ruin_d }
-      } | Format-Table -AutoSize
+        n='cap'; e={ if ($_.tag -match '_(\d{5})$') { ([int]$Matches[1]) / 10000.0 } else { $null } }
+      }, @{ n='EW'; e={ $_.EW_d } }, @{ n='ES95'; e={ $_.ES95_d } }, @{ n='Ruin'; e={ $_.Ruin_d } } |
+      Format-Table -AutoSize
   }
 
   $best = $sorted | Select-Object -First 1
@@ -238,12 +214,6 @@ function BestByPrefix {
 }
 
 function PromoteBestFromSweep {
-  <#
-    .SYNOPSIS
-      BestByPrefix로 고른 cap으로 롱런 실행
-    .EXAMPLE
-      PromoteBestFromSweep -Prefix 'cap_sweep_e80_' -Epochs 400 -Entropy 0.0012 -Tag 'final_cap_from_sweep'
-  #>
   [CmdletBinding()]
   param(
     [string] $Prefix  = 'cap_sweep_e80_',
@@ -263,15 +233,9 @@ function PromoteBestFromSweep {
 }
 
 # -----------------------------
-# (선택) 깨끗한 행만 남기는 정리 유틸
+# metrics 정리/병합 유틸 (이름 충돌 방지: cmmerge / cmclean)
 # -----------------------------
 function Clean-MetricsCsv {
-  <#
-    .SYNOPSIS
-      metrics.csv에서 숫자 필드(EW/ES95/Ruin) 깨진 행 제거
-    .EXAMPLE
-      Clean-MetricsCsv -InPlace
-  #>
   [CmdletBinding()] param([switch]$InPlace)
 
   if (-not (Test-Path $METRICS)) { Write-Warning "metrics.csv not found"; return }
@@ -290,21 +254,14 @@ function Clean-MetricsCsv {
   }
 }
 
-# ===== Utils: metrics merge/clean =====
-function cmcsv {
-  param(
-    [switch]$InPlace
-  )
+function CmMerge {
+  param([switch]$InPlace)
   $root = "D:\01_simul"
   $script = Join-Path $root "scripts\merge_metrics.ps1"
-  if ($InPlace) {
-    pwsh -File $script -Root $root -InPlace
-  } else {
-    pwsh -File $script -Root $root
-  }
+  if ($InPlace) { pwsh -File $script -Root $root -InPlace } else { pwsh -File $script -Root $root }
 }
 
-# ===== Report: plot metrics & export (alias 충돌 방지용 이름: rpt) =====
+# ===== Report: plot metrics & export (alias 충돌 방지: rpt) =====
 function rpt {
   param(
     [string]$In = "D:\01_simul\outputs\paper_main\_logs\metrics.csv",
@@ -322,15 +279,77 @@ function rpt {
   & $py $script @args
 }
 
-# (선택) 기존 Windows 기본 alias 'rp'를 그대로 두고 싶다면 아무 것도 안 하셔도 됩니다.
-# (대신 앞으로는 rpt 를 쓰세요)
-# (고급) 정말 'rp'로 쓰고 싶다면 아래 2줄을 presets.ps1 상단에 추가하면 alias를 지워 재정의할 수 있습니다:
-#   if (Get-Alias rp -ErrorAction SilentlyContinue) { Remove-Item alias:rp -Force }
-#   function rp { param([Parameter(ValueFromRemainingArguments=$true)]$args) rpt @args }
+# -----------------------------
+# 헬퍼 3종 (외부 scripts\*.ps1 의존 없이 즉시 실행)
+# -----------------------------
+function capmicro {
+  param(
+    [double]$Start = 0.0042,
+    [double]$End   = 0.0048,
+    [double]$Step  = 0.0001,
+    [int]   $Epochs = 120,
+    [double]$Entropy = 0.0012,
+    [string]$TagPrefix = "cap_micro_e120",
+    [string]$DataWindow = $null   # null이면 COMMON 기본 적용
+  )
+  $caps = @()
+  for ($c=$Start; $c -le $End + 1e-12; $c += $Step) { $caps += [math]::Round($c,5) }
+  foreach ($c in $caps) {
+    $slug = "{0:D5}" -f [int]([math]::Round($c*10000,0))   # 0.0045 -> 00045
+    $tag  = "{0}_{1}" -f $TagPrefix, $slug
+    if ($null -ne $DataWindow -and $DataWindow) {
+      RunSim -Tag $tag -Epochs $Epochs -Entropy $Entropy -Cap $c -EsMode "wealth" -DataWindow $DataWindow
+    } else {
+      RunSim -Tag $tag -Epochs $Epochs -Entropy $Entropy -Cap $c -EsMode "wealth"
+    }
+  }
+}
 
+function sweepw {
+  param(
+    [string[]]$Windows = @("2000-01:2020-12","2005-01:2024-12"),
+    [double]$Cap = 0.0045,
+    [int]   $Epochs = 100,
+    [double]$Entropy = 0.0012,
+    [string]$TagPrefix = "cap005_window"
+  )
+  foreach ($win in $Windows) {
+    $slug = ($win -replace "[:\-]","_") -replace "__","_"
+    $capSlug = "{0:D5}" -f [int]([math]::Round($Cap*10000,0))
+    $tag  = "{0}_{1}_{2}" -f $TagPrefix, $slug, $capSlug
+    RunSim -Tag $tag -Epochs $Epochs -Entropy $Entropy -Cap $Cap -EsMode "wealth" -DataWindow $win
+  }
+}
+
+function esgrid {
+  param(
+    [double[]]$Lambdas = @(0.2,0.4,0.8,1.2),
+    [double]$Cap = 0.0045,
+    [int]   $Epochs = 120,
+    [double]$Entropy = 0.0012,
+    [double]$Alpha = 0.95,
+    [string]$TagPrefix = "esgrid_term",
+    [string]$DataWindow = "2005-01:2020-12"
+  )
+  foreach ($lam in $Lambdas) {
+    $lamStr = ("{0:0.00}" -f $lam).Replace(",",".")
+    $capSlug = "{0:D5}" -f [int]([math]::Round($Cap*10000,0))
+    $tag  = "{0}_l{1}_cap{2}" -f $TagPrefix, $lamStr, $capSlug
+
+    $extra = @(
+      '--rl_epochs', $Epochs,
+      '--entropy_coef', $Entropy,
+      '--rl_q_cap', $Cap,
+      '--es_mode', 'term',
+      '--cvar_stage','on','--alpha_stage', $Alpha, '--lambda_stage', $lamStr,
+      '--data_window', $DataWindow,
+      '--tag', $tag
+    )
+    & $PY -m $CLI @COMMON @RLBASE @extra
+  }
+}
 
 # === 편의 별칭 (충돌 회피 버전) ===
-# 'sc' = Set-Content, 'ft' = Format-Table 이라 읽기 전용 별칭과 충돌하므로 사용하지 않음
 Set-Alias rs    RunSim               -Scope Global -ErrorAction SilentlyContinue
 Set-Alias scp   SweepCap             -Scope Global -ErrorAction SilentlyContinue
 Set-Alias lm    LatestMetrics        -Scope Global -ErrorAction SilentlyContinue
@@ -338,4 +357,8 @@ Set-Alias wt    Warmup               -Scope Global -ErrorAction SilentlyContinue
 Set-Alias fbt   FindByTag            -Scope Global -ErrorAction SilentlyContinue
 Set-Alias bp    BestByPrefix         -Scope Global -ErrorAction SilentlyContinue
 Set-Alias pbs   PromoteBestFromSweep -Scope Global -ErrorAction SilentlyContinue
-Set-Alias cmcsv Clean-MetricsCsv     -Scope Global -ErrorAction SilentlyContinue
+# 과거 호환: cmcsv 호출 습관을 유지하고 싶은 경우 → clean에 매핑
+if (Get-Alias cmcsv -ErrorAction SilentlyContinue) { Remove-Item alias:cmcsv -Force }
+Set-Alias cmclean Clean-MetricsCsv   -Scope Global -ErrorAction SilentlyContinue
+Set-Alias cmmerge CmMerge            -Scope Global -ErrorAction SilentlyContinue
+Set-Alias cmcsv  Clean-MetricsCsv    -Scope Global -ErrorAction SilentlyContinue
