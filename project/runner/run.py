@@ -1,7 +1,7 @@
 # project/runner/run.py
 from __future__ import annotations
 import contextlib, os
-from typing import Any, Dict, Optional, Callable
+from typing import Any, Dict, Optional, Callable, Tuple
 
 from ..eval import evaluate
 from ..config import SimConfig
@@ -15,11 +15,70 @@ from .logging_filters import silence_stdio
 from ..data.loader import load_market_csv
 
 
+# --------------------------
+# Helpers: parsing mix / hedge
+# --------------------------
+def _parse_alpha_mix(args) -> Tuple[float, float, float]:
+    """
+    α 파싱: --alpha_mix "a,b,c" or 개별 --alpha_kr/us/au.
+    합이 1이 아니면 자동 정규화. 미지정 시 (1/3,1/3,1/3).
+    """
+    def _as_float(x, default=None):
+        try:
+            return float(x)
+        except Exception:
+            return default
+
+    if hasattr(args, "alpha_mix") and args.alpha_mix:
+        raw = str(args.alpha_mix).replace(" ", "")
+        parts = raw.split(",")
+        if len(parts) == 3:
+            kr = _as_float(parts[0], 1/3)
+            us = _as_float(parts[1], 1/3)
+            au = _as_float(parts[2], 1/3)
+        else:
+            kr = us = au = 1/3
+    else:
+        kr = _as_float(getattr(args, "alpha_kr", None), None)
+        us = _as_float(getattr(args, "alpha_us", None), None)
+        au = _as_float(getattr(args, "alpha_au", None), None)
+        if kr is None or us is None or au is None:
+            kr = us = au = 1/3
+
+    s = kr + us + au
+    if s <= 0:
+        kr = us = au = 1/3
+        s = 1.0
+    return (kr / s, us / s, au / s)
+
+
+def _get_fx_hedge_params(args) -> Tuple[float, float]:
+    """
+    h_FX ∈ [0,1], 연 환헤지비용(기본 0.002=0.2%)
+    CLI에 없으면 속성이 없을 수 있으니 조용히 기본값 사용.
+    """
+    h = getattr(args, "h_FX", getattr(args, "h_fx", None))
+    try:
+        h = float(h)
+    except Exception:
+        h = 0.0
+    h = max(0.0, min(1.0, h))
+
+    fx_cost_annual = getattr(args, "fx_hedge_cost", None)
+    try:
+        fx_cost_annual = float(fx_cost_annual)
+    except Exception:
+        fx_cost_annual = 0.002  # 0.2%p/년 (설계 문서 기본)
+    return h, fx_cost_annual
+
+
+# --------------------------
+# Data wiring (with mix & FX hedge)
+# --------------------------
 def _wire_market_data(cfg: SimConfig, args) -> None:
     """
     market_mode=bootstrap 인 경우 CSV 로더를 통해
-    원시 시계열(ret_asset, rf_real/nom, dates, cpi)을 cfg에 주입.
-    Env/actor/eval은 cfg에서 이를 사용.
+    원시 시계열을 cfg에 주입. (멀티자산 혼합 + 환헤지 반영)
     """
     # eval/plot에서 참조할 플래그도 cfg에 고정 주입
     setattr(cfg, "bands", getattr(args, "bands", "on"))
@@ -55,37 +114,85 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
         cache=True,
     )
 
+    # ---- 개별 시계열 추출 ----
+    ret_kr   = blob.get("ret_kr_eq")        # KR 주식 수익률(월)
+    ret_us_l = blob.get("ret_us_eq_krw")    # US 주식, KRW 기준(= FX 노출 포함)
+    ret_au   = blob.get("ret_gold_krw")     # 금(KRW)
+    rf_real  = blob.get("rf_real")
+    rf_nom   = blob.get("rf_nom")
+    dates    = blob.get("dates")
+    cpi      = blob.get("cpi")
+
+    # (가능 시) FX 월수익률: 로더가 제공하면 사용
+    ret_fx = blob.get("ret_fx") or blob.get("ret_fx_usdkrw") or None
+
+    # ---- 환헤지 처리 (US) ----
+    import numpy as np
+    steps_per_year = int(getattr(cfg, "steps_per_year", 12) or 12)
+    h_fx, fx_cost_ann = _get_fx_hedge_params(args)
+    fx_cost_m = float(fx_cost_ann) / float(steps_per_year)
+
+    if ret_us_l is None:
+        # 로더에 종합 risky 수익률만 있는 레거시 케이스
+        mixed = blob.get("ret_asset")
+    else:
+        # US 현지자산 수익률을 근사: KRW기준 수익률에서 FX를 제거
+        if ret_fx is not None:
+            ret_us_hedged = np.asarray(ret_us_l, dtype=float) - h_fx * np.asarray(ret_fx, dtype=float) - h_fx * fx_cost_m
+        else:
+            # FX 시계열이 없으면 비용만 차감(보수적 보정)
+            ret_us_hedged = np.asarray(ret_us_l, dtype=float) - h_fx * fx_cost_m
+
+        # ---- 믹스 가중합 ----
+        a_kr, a_us, a_au = _parse_alpha_mix(args)
+        # None 안전 처리
+        kr = np.asarray(ret_kr, dtype=float) if ret_kr is not None else 0.0
+        us = np.asarray(ret_us_hedged, dtype=float)
+        au = np.asarray(ret_au, dtype=float) if ret_au is not None else 0.0
+        # 브로드캐스트 대비, 모두 같은 길이 가정. 길이 불일치 시 가능한 최소 길이로 자름.
+        lens = [x.shape[0] for x in [kr, us, au] if isinstance(x, np.ndarray)]
+        T = min(lens) if len(lens) >= 1 else 0
+        if isinstance(kr, np.ndarray): kr = kr[:T]
+        if isinstance(us, np.ndarray): us = us[:T]
+        if isinstance(au, np.ndarray): au = au[:T]
+        mixed = a_kr * kr + a_us * us + a_au * au
+
+        # cfg에 믹스/헤지 파라미터 기록(평가/로그용)
+        setattr(cfg, "alpha_mix", (a_kr, a_us, a_au))
+        setattr(cfg, "h_FX", h_fx)
+        setattr(cfg, "fx_hedge_cost_annual", fx_cost_ann)
+
     # Env에서 사용할 수 있도록 cfg에 부착
-    setattr(cfg, "data_dates", blob.get("dates"))
-    setattr(cfg, "data_cpi", blob.get("cpi"))
-    setattr(cfg, "data_ret_series", blob.get("ret_asset"))
+    setattr(cfg, "data_dates", dates)
+    setattr(cfg, "data_cpi", cpi)
+    setattr(cfg, "data_ret_series", mixed)
 
     # 실질/명목 RF 선택 주입
     if getattr(args, "use_real_rf", "on") == "on":
-        setattr(cfg, "data_rf_series", blob.get("rf_real"))
+        setattr(cfg, "data_rf_series", rf_real)
     else:
-        setattr(cfg, "data_rf_series", blob.get("rf_nom"))
+        setattr(cfg, "data_rf_series", rf_nom)
 
     # 보조 시계열(선택적으로 활용)
-    setattr(cfg, "data_ret_kr_eq", blob.get("ret_kr_eq"))
-    setattr(cfg, "data_ret_us_eq_krw", blob.get("ret_us_eq_krw"))
-    setattr(cfg, "data_ret_gold_krw", blob.get("ret_gold_krw"))
+    setattr(cfg, "data_ret_kr_eq", ret_kr)
+    setattr(cfg, "data_ret_us_eq_krw", ret_us_l)
+    setattr(cfg, "data_ret_gold_krw", ret_au)
 
     # ---- 진단 로그 (quiet=off 일 때만) ----
     if str(getattr(args, "quiet", "on")).lower() != "on":
-        import numpy as _np
-        _ret = blob.get("ret_asset")
-        _rf = blob.get("rf_real") if getattr(args, "use_real_rf", "on") == "on" else blob.get("rf_nom")
         try:
-            ret_mean = float(_np.nanmean(_ret)) if _ret is not None else float("nan")
-            rf_mean = float(_np.nanmean(_rf)) if _rf is not None else float("nan")
+            import numpy as _np
+            ret_mean = float(_np.nanmean(mixed)) if mixed is not None else float("nan")
+            rf_mean = float(_np.nanmean(rf_real if getattr(args, "use_real_rf", "on") == "on" else rf_nom)) if (rf_real is not None or rf_nom is not None) else float("nan")
+            a = getattr(cfg, "alpha_mix", None)
+            a_str = f"alpha={a}" if a is not None else "alpha=legacy"
             print(
-                f"[data] len={len(_ret) if _ret is not None else 0}, "
+                f"[data] len={len(mixed) if mixed is not None else 0}, "
                 f"ret_mean={ret_mean:.4f}, rf_mean={rf_mean:.4f}, "
+                f"h_FX={getattr(cfg,'h_FX',0.0):.2f}, {a_str}, "
                 f"asset={getattr(cfg, 'asset', '?')}, window={getattr(cfg, 'data_window', None)}"
             )
         except Exception:
-            # 진단 로그 실패 시 조용히 패스
             pass
 
 
@@ -116,7 +223,6 @@ def _to_actor(policy_like: Any) -> Callable[[Dict[str, Any]], tuple[float, float
         else:
             raise RuntimeError("actor must return (q, w) or dict with keys 'q','w'")
         return float(q), float(w)
-
     return _actor
 
 
@@ -346,6 +452,8 @@ def run_rl(args):
             "u_scale": getattr(args, "u_scale", None),
             "lw_scale": getattr(args, "lw_scale", None),
             "tag": getattr(args, "tag", None),
+            "alpha_mix": getattr(cfg, "alpha_mix", None),
+            "h_FX": getattr(cfg, "h_FX", None),
         },
         ckpt_path=ckpt_path,
         extra=extras_dict,   # 여기 안에 eval_WT 등 경로 정보가 포함될 수 있음
