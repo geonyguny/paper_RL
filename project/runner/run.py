@@ -1,6 +1,9 @@
 # project/runner/run.py
 from __future__ import annotations
-import contextlib, os
+
+import contextlib
+import os
+import time
 from typing import Any, Dict, Optional, Callable, Tuple
 
 from ..eval import evaluate
@@ -13,6 +16,19 @@ from .logging_filters import silence_stdio
 
 # market CSV loader
 from ..data.loader import load_market_csv
+
+
+# --------------------------
+# Utilities
+# --------------------------
+def _fmt_hms(sec: float) -> str:
+    try:
+        total = int(round(float(sec)))
+        m, s = divmod(total, 60)
+        h, m = divmod(m, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    except Exception:
+        return "00:00:00"
 
 
 # --------------------------
@@ -33,21 +49,21 @@ def _parse_alpha_mix(args) -> Tuple[float, float, float]:
         raw = str(args.alpha_mix).replace(" ", "")
         parts = raw.split(",")
         if len(parts) == 3:
-            kr = _as_float(parts[0], 1/3)
-            us = _as_float(parts[1], 1/3)
-            au = _as_float(parts[2], 1/3)
+            kr = _as_float(parts[0], 1 / 3)
+            us = _as_float(parts[1], 1 / 3)
+            au = _as_float(parts[2], 1 / 3)
         else:
-            kr = us = au = 1/3
+            kr = us = au = 1 / 3
     else:
         kr = _as_float(getattr(args, "alpha_kr", None), None)
         us = _as_float(getattr(args, "alpha_us", None), None)
         au = _as_float(getattr(args, "alpha_au", None), None)
         if kr is None or us is None or au is None:
-            kr = us = au = 1/3
+            kr = us = au = 1 / 3
 
     s = kr + us + au
     if s <= 0:
-        kr = us = au = 1/3
+        kr = us = au = 1 / 3
         s = 1.0
     return (kr / s, us / s, au / s)
 
@@ -115,13 +131,13 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
     )
 
     # ---- 개별 시계열 추출 ----
-    ret_kr   = blob.get("ret_kr_eq")        # KR 주식 수익률(월)
-    ret_us_l = blob.get("ret_us_eq_krw")    # US 주식, KRW 기준(= FX 노출 포함)
-    ret_au   = blob.get("ret_gold_krw")     # 금(KRW)
-    rf_real  = blob.get("rf_real")
-    rf_nom   = blob.get("rf_nom")
-    dates    = blob.get("dates")
-    cpi      = blob.get("cpi")
+    ret_kr = blob.get("ret_kr_eq")            # KR 주식 수익률(월)
+    ret_us_l = blob.get("ret_us_eq_krw")      # US 주식, KRW 기준(= FX 노출 포함)
+    ret_au = blob.get("ret_gold_krw")         # 금(KRW)
+    rf_real = blob.get("rf_real")
+    rf_nom = blob.get("rf_nom")
+    dates = blob.get("dates")
+    cpi = blob.get("cpi")
 
     # (가능 시) FX 월수익률: 로더가 제공하면 사용
     ret_fx = blob.get("ret_fx") or blob.get("ret_fx_usdkrw") or None
@@ -138,7 +154,11 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
     else:
         # US 현지자산 수익률을 근사: KRW기준 수익률에서 FX를 제거
         if ret_fx is not None:
-            ret_us_hedged = np.asarray(ret_us_l, dtype=float) - h_fx * np.asarray(ret_fx, dtype=float) - h_fx * fx_cost_m
+            ret_us_hedged = (
+                np.asarray(ret_us_l, dtype=float)
+                - h_fx * np.asarray(ret_fx, dtype=float)
+                - h_fx * fx_cost_m
+            )
         else:
             # FX 시계열이 없으면 비용만 차감(보수적 보정)
             ret_us_hedged = np.asarray(ret_us_l, dtype=float) - h_fx * fx_cost_m
@@ -152,9 +172,12 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
         # 브로드캐스트 대비, 모두 같은 길이 가정. 길이 불일치 시 가능한 최소 길이로 자름.
         lens = [x.shape[0] for x in [kr, us, au] if isinstance(x, np.ndarray)]
         T = min(lens) if len(lens) >= 1 else 0
-        if isinstance(kr, np.ndarray): kr = kr[:T]
-        if isinstance(us, np.ndarray): us = us[:T]
-        if isinstance(au, np.ndarray): au = au[:T]
+        if isinstance(kr, np.ndarray):
+            kr = kr[:T]
+        if isinstance(us, np.ndarray):
+            us = us[:T]
+        if isinstance(au, np.ndarray):
+            au = au[:T]
         mixed = a_kr * kr + a_us * us + a_au * au
 
         # cfg에 믹스/헤지 파라미터 기록(평가/로그용)
@@ -183,7 +206,8 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
         try:
             import numpy as _np
             ret_mean = float(_np.nanmean(mixed)) if mixed is not None else float("nan")
-            rf_mean = float(_np.nanmean(rf_real if getattr(args, "use_real_rf", "on") == "on" else rf_nom)) if (rf_real is not None or rf_nom is not None) else float("nan")
+            rf_series = rf_real if getattr(args, "use_real_rf", "on") == "on" else rf_nom
+            rf_mean = float(_np.nanmean(rf_series)) if rf_series is not None else float("nan")
             a = getattr(cfg, "alpha_mix", None)
             a_str = f"alpha={a}" if a is not None else "alpha=legacy"
             print(
@@ -223,48 +247,116 @@ def _to_actor(policy_like: Any) -> Callable[[Dict[str, Any]], tuple[float, float
         else:
             raise RuntimeError("actor must return (q, w) or dict with keys 'q','w'")
         return float(q), float(w)
+
     return _actor
 
 
+# --- evaluate 결과 정규화 유틸 ---
+def _normalize_evaluate_output(ret, es_mode: str):
+    """evaluate 반환을 (metrics: dict, extras: dict)로 정규화."""
+    metrics, extras = {}, {}
+
+    if isinstance(ret, dict):
+        metrics = ret
+    elif isinstance(ret, tuple):
+        if len(ret) >= 1 and isinstance(ret[0], dict):
+            metrics = ret[0]
+        if len(ret) >= 2 and isinstance(ret[1], dict):
+            extras = ret[1]
+        # 그 외 (길이>2, dict가 아닌 두 번째 요소 등)도 extras에 참고용으로 보관
+        if len(ret) > 2:
+            extras["_rest"] = ret[2:]
+    else:
+        metrics = {"note": "unexpected evaluate return type", "type": str(type(ret))}
+
+    if "es_mode" not in metrics:
+        metrics["es_mode"] = str(es_mode).lower()
+    return metrics, extras
+
+
+def _call_evaluate(cfg, actor, es_mode: str):
+    """return_paths 지원/비지원 모두 안전 호출."""
+    try:
+        ret = evaluate(cfg, actor, es_mode=str(es_mode).lower(), return_paths=True)
+    except TypeError:
+        ret = evaluate(cfg, actor, es_mode=str(es_mode).lower())
+    return _normalize_evaluate_output(ret, es_mode)
+
+
 def run_once(args) -> Dict[str, Any]:
-    quiet_ctx = silence_stdio(also_stderr=True) if getattr(args, "quiet", "on") == "on" else contextlib.nullcontext()
+    t_all_0 = time.perf_counter()
+
+    quiet_ctx = (
+        silence_stdio(also_stderr=True)
+        if getattr(args, "quiet", "on") == "on"
+        else contextlib.nullcontext()
+    )
     with quiet_ctx:
+        t0 = time.perf_counter()
         cfg: SimConfig = make_cfg(args)
+        time_make_cfg = time.perf_counter() - t0
+
         ensure_dir(args.outputs)
 
         # tag → cfg 주입 (autosave에서 사용)
         if getattr(args, "tag", None) is not None:
             setattr(cfg, "tag", args.tag)
 
+        t1 = time.perf_counter()
         # 실데이터 로더와 연결 (bootstrap일 때만)
         _wire_market_data(cfg, args)
+        time_wire_data = time.perf_counter() - t1
 
         # 연금 오버레이(필요 시 설정)
+        t2 = time.perf_counter()
         ann_enabled = (
             str(getattr(args, "ann_on", "off")).lower() == "on"
             and float(getattr(args, "ann_alpha", 0.0) or 0.0) > 0.0
         )
         if ann_enabled:
             setup_annuity_overlay(cfg, args)
+        time_annuity = time.perf_counter() - t2
 
         # 정책 생성 → 평가
+        t3 = time.perf_counter()
         actor = build_actor(cfg, args)
-        m, extras = evaluate(cfg, actor, es_mode=args.es_mode)
+        time_build_actor = time.perf_counter() - t3
+
+        t4 = time.perf_counter()
+        m, extras = _call_evaluate(cfg, actor, es_mode=args.es_mode)
+        time_eval = time.perf_counter() - t4
 
     # --- 메트릭 병합: 연금 파생 파라미터는 항상 기록(미설정 시 0.0) ---
     if isinstance(m, dict):
         y_ann = float(getattr(cfg, "y_ann", 0.0) or 0.0)
         a_fac = float(getattr(cfg, "ann_a_factor", 0.0) or 0.0)
         P_val = float(getattr(cfg, "ann_P", 0.0) or 0.0)
-        m.update({
-            "y_ann": y_ann if (y_ann != 0.0) else 0.0,
-            "ann_a_factor": a_fac if (a_fac != 0.0) else 0.0,  # 편의상 유지
-            "a_factor": a_fac if (a_fac != 0.0) else 0.0,      # CSV에 쓰이는 필드
-            "P": P_val if (P_val != 0.0) else 0.0,
-        })
+        m.update(
+            {
+                "y_ann": y_ann if (y_ann != 0.0) else 0.0,
+                "ann_a_factor": a_fac if (a_fac != 0.0) else 0.0,  # 편의상 유지
+                "a_factor": a_fac if (a_fac != 0.0) else 0.0,      # CSV에 쓰이는 필드
+                "P": P_val if (P_val != 0.0) else 0.0,
+            }
+        )
 
     # 총 평가 경로 수
-    n_paths_total = getattr(cfg, "n_paths_eval", getattr(cfg, "n_paths", 0)) * len(getattr(cfg, "seeds", []))
+    n_paths_total = (
+        getattr(cfg, "n_paths_eval", getattr(cfg, "n_paths", 0))
+        * len(getattr(cfg, "seeds", []))
+    )
+
+    # 타이밍 집계
+    time_total = time.perf_counter() - t_all_0
+    timing = {
+        "make_cfg_s": round(time_make_cfg, 6),
+        "wire_data_s": round(time_wire_data, 6),
+        "annuity_setup_s": round(time_annuity, 6),
+        "build_actor_s": round(time_build_actor, 6),
+        "evaluate_s": round(time_eval, 6),
+        "total_s": round(time_total, 6),
+        "total_hms": _fmt_hms(time_total),
+    }
 
     out = dict(
         asset=cfg.asset,
@@ -280,6 +372,9 @@ def run_once(args) -> Dict[str, Any]:
         n_paths=n_paths_total,
         args=slim_args(args),
         extra=extras,  # 경로 등 부가정보 (CSV에는 저장 안 함)
+        timing=timing,
+        time_total_s=timing["total_s"],
+        time_total_hms=timing["total_hms"],
     )
 
     if getattr(args, "autosave", "off") == "on":
@@ -303,7 +398,9 @@ def _maybe_load_actor_from_ckpt(
     # 최신 로더 우선 (cfg 힌트 전달)
     try:
         from ..trainer.policy_io import load_policy_as_actor  # type: ignore
+        t0 = time.perf_counter()
         actor = load_policy_as_actor(ckpt_path, cfg_hint=cfg_hint)  # 새 시그니처
+        _ = time.perf_counter() - t0  # 로딩 시간은 run_rl의 timing에서 별도 측정
         if callable(actor):
             return actor
     except Exception:
@@ -317,6 +414,7 @@ def _maybe_load_actor_from_ckpt(
         ("..trainer.rl_io", "load_actor"),
     ]
     import importlib
+
     for mod, attr in loaders:
         try:
             modobj = importlib.import_module(mod, package=__package__)
@@ -324,36 +422,47 @@ def _maybe_load_actor_from_ckpt(
             try:
                 policy_like = loader(ckpt_path, cfg_hint)  # cfg_hint 지원 로더
             except TypeError:
-                policy_like = loader(ckpt_path)            # 구형 시그니처
-            return _to_actor(policy_like)                  # actor/policy-like 모두 지원
+                policy_like = loader(ckpt_path)  # 구형 시그니처
+            return _to_actor(policy_like)  # actor/policy-like 모두 지원
         except Exception:
             continue
     return None
 
 
 def run_rl(args):
+    t_all_0 = time.perf_counter()
+
     # RL도 동일하게 cfg 주입 → trainer 내부 Env 생성 시 실데이터 사용
+    t0 = time.perf_counter()
     cfg: SimConfig = make_cfg(args)
+    time_make_cfg = time.perf_counter() - t0
+
     ensure_dir(args.outputs)
 
     # tag → cfg 주입 (RL도 동일)
     if getattr(args, "tag", None) is not None:
         setattr(cfg, "tag", args.tag)
 
+    t1 = time.perf_counter()
     _wire_market_data(cfg, args)
+    time_wire_data = time.perf_counter() - t1
 
     ann_enabled = (
         str(getattr(args, "ann_on", "off")).lower() == "on"
         and float(getattr(args, "ann_alpha", 0.0) or 0.0) > 0.0
     )
+    t2 = time.perf_counter()
     if ann_enabled:
         setup_annuity_overlay(cfg, args)
+    time_annuity = time.perf_counter() - t2
 
     try:
         from ..trainer.rl_a2c import train_rl
     except Exception as e:
         raise SystemExit(f"RL trainer import failed: {e}")
 
+    # 학습 호출 자체의 벽시계 시간 래핑(트레이너가 별도로 제공하는 train_time_s와는 별개)
+    t3 = time.perf_counter()
     fields: Dict[str, Any] = train_rl(
         cfg,
         seed_list=args.seeds,
@@ -361,19 +470,23 @@ def run_rl(args):
         n_paths_eval=args.rl_n_paths_eval,
         rl_epochs=args.rl_epochs,
         steps_per_epoch=args.rl_steps_per_epoch,
-        lr=args.lr, gae_lambda=args.gae_lambda,
-        entropy_coef=args.entropy_coef, value_coef=args.value_coef,
+        lr=args.lr,
+        gae_lambda=args.gae_lambda,
+        entropy_coef=args.entropy_coef,
+        value_coef=args.value_coef,
         max_grad_norm=args.max_grad_norm,
     )
+    time_train_call = time.perf_counter() - t3
 
     # trainer가 선택적으로 반환할 수 있는 확장 필드들(없으면 None)
-    best_epoch   = fields.get("best_epoch")
-    ckpt_path    = fields.get("ckpt_path")   # 예: outputs/<tag>/policy.pt
+    best_epoch = fields.get("best_epoch")
+    ckpt_path = fields.get("ckpt_path")  # 예: outputs/<tag>/policy.pt
     train_time_s = fields.get("train_time_s")
-    eval_time_s  = fields.get("eval_time_s")
+    eval_time_s = fields.get("eval_time_s")
 
     # --- actor 획득 시도: 반환 필드 → ckpt 로딩 → 실패 시 None ---
     policy_like = fields.get("actor") or fields.get("policy") or fields.get("pi") or fields.get("agent")
+    t4 = time.perf_counter()
     actor: Optional[Callable[[Dict[str, Any]], tuple[float, float]]] = None
     try:
         if policy_like is not None:
@@ -382,29 +495,33 @@ def run_rl(args):
         actor = None
     if actor is None:
         actor = _maybe_load_actor_from_ckpt(ckpt_path, cfg_hint=cfg)
+    time_actor_load = time.perf_counter() - t4
 
     # 총 평가 경로 수(= rl_n_paths_eval × seeds 수)
     n_paths_total = int(getattr(args, "rl_n_paths_eval", 0)) * len(getattr(args, "seeds", []))
 
     # --- 옵션: actor를 그대로 반환해 CLI가 재평가 하도록 위임 (권장 경로) ---
-    if actor is not None and getattr(args, "return_actor", "on") == "on":
-        # CLI는 (cfg, actor) 튜플을 받으면 evaluate를 호출해 W_T 기반으로 ES95를 정확히 산출
+    if actor is not None and str(getattr(args, "return_actor", "off")).lower() == "on":
+        # CLI 경로에서 총 시간은 CLI가 별도 계측
         return (cfg, actor)
 
     # --- 폴백 경로: 여기서 바로 evaluate 수행 ---
     metrics_dict: Dict[str, Any]
     extras_dict: Dict[str, Any] = {}
 
+    t5 = time.perf_counter()
     if actor is not None:
         try:
-            metrics_dict, extras_dict = evaluate(cfg, actor, es_mode=getattr(args, "es_mode", "wealth"))
+            metrics_dict, extras_dict = _call_evaluate(cfg, actor, es_mode=getattr(args, "es_mode", "wealth"))
             # 러닝 메타 부가
-            metrics_dict.update({
-                "best_epoch": best_epoch,
-                "train_time_s": train_time_s,
-                "eval_time_s": eval_time_s,
-            })
-            # 소스 표기(wealth/loss는 evaluate가 이미 es95_source를 넣어줌)
+            metrics_dict.update(
+                {
+                    "best_epoch": best_epoch,
+                    "train_time_s": train_time_s,
+                    "eval_time_s": eval_time_s,
+                }
+            )
+            # 소스 표기(wealth/loss는 evaluate가 이미 es95_source를 넣어줄 수 있음)
             metrics_dict.setdefault("es95_source", "computed_in_evaluate")
         except Exception as e:
             # 평가 실패 시 trainer 메트릭으로 폴백
@@ -430,6 +547,20 @@ def run_rl(args):
             "eval_time_s": eval_time_s,
             "es95_note": "no actor available (trainer didn't return policy and ckpt loader failed)",
         }
+    time_eval = time.perf_counter() - t5
+
+    # 타이밍 집계
+    time_total = time.perf_counter() - t_all_0
+    timing = {
+        "make_cfg_s": round(time_make_cfg, 6),
+        "wire_data_s": round(time_wire_data, 6),
+        "annuity_setup_s": round(time_annuity, 6),
+        "train_call_s": round(time_train_call, 6),  # train_rl 호출 벽시계 시간
+        "actor_load_s": round(time_actor_load, 6),
+        "evaluate_s": round(time_eval, 6),
+        "total_s": round(time_total, 6),
+        "total_hms": _fmt_hms(time_total),
+    }
 
     out = dict(
         asset=cfg.asset,
@@ -443,7 +574,8 @@ def run_rl(args):
         F_target=cfg.F_target,
         es_mode=getattr(args, "es_mode", "wealth"),
         n_paths=n_paths_total,
-        args=slim_args(args) | {
+        args=slim_args(args)
+        | {
             # 결과 재현을 위해 args에도 몇 가지 핵심 하이퍼 명시
             "rl_q_cap": getattr(args, "rl_q_cap", None),
             "teacher_eps0": getattr(args, "teacher_eps0", None),
@@ -457,6 +589,9 @@ def run_rl(args):
         },
         ckpt_path=ckpt_path,
         extra=extras_dict,   # 여기 안에 eval_WT 등 경로 정보가 포함될 수 있음
+        timing=timing,
+        time_total_s=timing["total_s"],
+        time_total_hms=timing["total_hms"],
     )
 
     # RL도 autosave 동일 적용

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import math
+import time
 from typing import Optional, Any, Dict, Iterable
 
 from ..config import (
@@ -70,6 +71,16 @@ def _cvar_fallback(losses: Iterable[float], alpha: float) -> float:
     return float(ES)
 
 
+def _fmt_hms(sec: float) -> str:
+    try:
+        total = int(round(float(sec)))
+        m, s = divmod(total, 60)
+        h, m = divmod(m, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    except Exception:
+        return "00:00:00"
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
 
@@ -119,13 +130,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--bequest_kappa", type=float, default=0.0)
     p.add_argument("--bequest_gamma", type=float, default=1.0)
 
-    # CVaR calibration
+    # CVaR calibration (lambda) + 확장: calib_param, F 구간
     p.add_argument("--cvar_target", type=float, default=CVAR_TARGET_DEFAULT)
     p.add_argument("--cvar_tol", type=float, default=CVAR_TOL_DEFAULT)
     p.add_argument("--lambda_min", type=float, default=LAMBDA_MIN_DEFAULT)
     p.add_argument("--lambda_max", type=float, default=LAMBDA_MAX_DEFAULT)
     p.add_argument("--calib_fast", choices=["on", "off"], default="on")
     p.add_argument("--calib_max_iter", type=int, default=8)
+    p.add_argument("--calib_param", choices=["lambda", "F"], default="lambda",
+                   help="CVaR 캘리브레이션 대상 파라미터: lambda(기본) 또는 F(F_target 보정)")
+    p.add_argument("--F_min", type=float, default=None,
+                   help="calib_param=F일 때 탐색 하한(미지정시 F_target-0.5)")
+    p.add_argument("--F_max", type=float, default=None,
+                   help="calib_param=F일 때 탐색 상한(미지정시 F_target+0.5)")
 
     # autosave
     p.add_argument("--autosave", choices=["on", "off"], default="off")
@@ -408,6 +425,10 @@ def _prune_for_stdout(args: argparse.Namespace, out: Dict[str, Any]) -> Any:
 
     if mode == "metrics":
         mini = _sel_metrics(metrics, keys)
+        # 타이밍도 같이 내려줌
+        if isinstance(out, dict):
+            mini["time_total_s"] = out.get("time_total_s")
+            mini["time_total_hms"] = out.get("time_total_hms")
         mini.update({
             "tag": out.get("tag") if isinstance(out, dict) else None,
             "asset": out.get("asset") if isinstance(out, dict) else None,
@@ -427,12 +448,24 @@ def _prune_for_stdout(args: argparse.Namespace, out: Dict[str, Any]) -> Any:
             "metrics": _sel_metrics(metrics, keys),
             "n_paths": n_paths_guess,
             "T": (out.get("extra") or {}).get("T") if isinstance(out, dict) else None,
+            # CLI 총 실행시간
+            "time_total_s": out.get("time_total_s") if isinstance(out, dict) else None,
+            "time_total_hms": out.get("time_total_hms") if isinstance(out, dict) else None,
         }
 
     return out  # 안전망
 
 
 def _maybe_evaluate_with_es_mode(res: Any, es_mode: str) -> Dict[str, Any]:
+    # (metrics, extras) 튜플을 그대로 받은 경우 처리
+    if isinstance(res, tuple) and len(res) >= 1 and isinstance(res[0], dict):
+        pack = {"metrics": res[0]}
+        if len(res) >= 2 and isinstance(res[1], dict):
+            pack["extra"] = res[1]
+        if "es_mode" not in pack["metrics"]:
+            pack["metrics"]["es_mode"] = str(es_mode).lower()
+        return pack
+
     """run_* 결과가 dict면 그대로 사용.
     (cfg, actor) 형태면 evaluate(cfg, actor, es_mode=...) 호출 → dict로 변환.
     """
@@ -492,6 +525,9 @@ def _maybe_evaluate_with_es_mode(res: Any, es_mode: str) -> Dict[str, Any]:
 # --------------------------
 
 def main():
+    # 전체 실행시간(벽시계) 측정 시작
+    t0 = time.perf_counter()
+
     p = _build_arg_parser()
     args = p.parse_args()
 
@@ -521,6 +557,12 @@ def main():
                 tgt["es95_note"] = f"post-fixup failed: {type(_e).__name__}"
         except Exception:
             pass
+
+    # 전체 실행시간 기록
+    elapsed = time.perf_counter() - t0
+    if isinstance(out, dict):
+        out["time_total_s"] = round(elapsed, 3)
+        out["time_total_hms"] = _fmt_hms(elapsed)
 
     # 표준출력 제어 적용
     to_print = _prune_for_stdout(args, out) if isinstance(out, dict) else out
