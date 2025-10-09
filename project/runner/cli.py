@@ -7,7 +7,8 @@ import os
 import re
 import math
 import time
-from typing import Optional, Any, Dict, Iterable
+import sys
+from typing import Optional, Any, Dict, Iterable, Tuple, List
 
 from ..config import (
     CVAR_TARGET_DEFAULT,
@@ -16,7 +17,7 @@ from ..config import (
     LAMBDA_MAX_DEFAULT,
 )
 from .run import run_once, run_rl
-from .calibrate import calibrate_lambda
+from .calibrate import calibrate_lambda  # ← 캘리브레이션 엔트리포인트
 
 # --- evaluate: 다양한 배치에 대응(절대 경로 우선) ---
 def _import_evaluate():
@@ -45,21 +46,14 @@ except Exception:
 
 
 def _cvar_fallback(losses: Iterable[float], alpha: float) -> float:
-    """보간 포함 CVaR_α (Acerbi–Tasche 표본식).
-    손실 L_(1) <= ... <= L_(n)에 대해
-      j = floor(n*α), θ = n*α - j
-      ES = ((1-θ)*L_(j+1) + sum_{i=j+2}^n L_(i)) / (n*(1-α))
-    """
+    """보간 포함 CVaR_α (Acerbi–Tasche 표본식)."""
     import numpy as np
     L = np.asarray(list(losses), dtype=float)
     n = L.size
     if n == 0:
         return 0.0
-
     a = float(alpha)
-    # 안전 가드: 0 < α < 1
-    a = max(min(a, 1.0 - 1e-12), 1e-12)
-
+    a = max(min(a, 1.0 - 1e-12), 1e-12)  # 0<α<1 가드
     L.sort()                     # 오름차순
     j = int(math.floor(n * a))   # 0-베이스 index
     if j >= n:
@@ -79,6 +73,159 @@ def _fmt_hms(sec: float) -> str:
         return f"{h:02d}:{m:02d}:{s:02d}"
     except Exception:
         return "00:00:00"
+
+
+def _parse_hms_to_seconds(hms: Optional[str]) -> Optional[float]:
+    if not hms:
+        return None
+    s = str(hms).strip()
+    try:
+        parts = s.split(":")
+        if len(parts) == 3:
+            h, m, sec = map(int, parts)
+            return float(h) * 3600 + float(m) * 60 + float(sec)
+        if len(parts) == 2:  # mm:ss
+            m, sec = map(int, parts)
+            return float(m) * 60 + float(sec)
+        # 숫자만 주면 초로 해석
+        return float(s)
+    except Exception:
+        return None
+
+
+# ==========================
+# ETA 히스토리/추정 유틸
+# ==========================
+def _eta_db_path(args: argparse.Namespace) -> str:
+    default = os.path.join(getattr(args, "outputs", "./outputs"), ".eta_history.json")
+    return getattr(args, "eta_db", default) or default
+
+def _eta_load_db(path: str) -> List[Dict[str, Any]]:
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+    except Exception:
+        pass
+    return []
+
+def _eta_save_db(path: str, rows: List[Dict[str, Any]]) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(rows[-500:], f, ensure_ascii=False, indent=0)  # 최근 500건만 유지
+    except Exception:
+        pass
+
+def _seeds_count(args: argparse.Namespace) -> int:
+    s = getattr(args, "seeds", [])
+    if isinstance(s, int):
+        return 1
+    if isinstance(s, (list, tuple)):
+        return max(1, len(s))
+    return 1
+
+def _eta_signature(args: argparse.Namespace) -> Dict[str, Any]:
+    # 예측에 중요할만한 항목만 선택
+    return {
+        "method": getattr(args, "method", None),
+        "market_mode": getattr(args, "market_mode", None),
+        "data_profile": getattr(args, "data_profile", None),
+        "asset": getattr(args, "asset", None),
+        "es_mode": getattr(args, "es_mode", None),
+
+        # 공통 규모지표
+        "n_paths": getattr(args, "n_paths", None),
+        "seeds": _seeds_count(args),
+
+        # RL 규모지표
+        "rl_epochs": getattr(args, "rl_epochs", None),
+        "rl_steps_per_epoch": getattr(args, "rl_steps_per_epoch", None),
+        "rl_n_paths_eval": getattr(args, "rl_n_paths_eval", None),
+
+        # HJB 프리셋(있으면)
+        "hjb_W_grid": getattr(args, "hjb_W_grid", None),
+        "hjb_Nshock": getattr(args, "hjb_Nshock", None),
+        "hjb_eta_n": getattr(args, "hjb_eta_n", None),
+    }
+
+def _eta_match_score(a: Dict[str, Any], b: Dict[str, Any]) -> int:
+    # 간단 가중치 매칭 점수(완전 동일 필드 수)
+    keys = ["method", "market_mode", "data_profile", "asset", "es_mode"]
+    score = sum(1 for k in keys if a.get(k) == b.get(k))
+    return score
+
+def _eta_predict_from_history(args: argparse.Namespace, db: List[Dict[str, Any]]) -> Tuple[Optional[float], str]:
+    sig = _eta_signature(args)
+    # 후보: 동일 메소드 + 같은 데이터 프로파일 중심으로 최근 50건
+    candidates: List[Dict[str, Any]] = []
+    for row in reversed(db):
+        r_sig = row.get("sig", {})
+        if r_sig.get("method") != sig.get("method"):
+            continue
+        if r_sig.get("data_profile") != sig.get("data_profile"):
+            continue
+        candidates.append(row)
+        if len(candidates) >= 50:
+            break
+
+    if not candidates:
+        return None, "no_history"
+
+    # 최근 최고 매칭을 하나 고르고, 규모 비율로 스케일
+    # 휴리스틱: RL은 step/epoch/seed 합성 규모, HJB는 n_paths*seeds
+    best = max(candidates, key=lambda r: _eta_match_score(sig, r.get("sig", {})))
+    base_time = float(best.get("time_total_s", 0.0) or 0.0)
+    if base_time <= 0:
+        return None, "bad_history_base"
+
+    ref = best.get("sig", {})
+    method = sig.get("method")
+
+    try:
+        if method == "rl":
+            seeds = max(1, int(sig.get("seeds") or 1))
+            ref_seeds = max(1, int(ref.get("seeds") or 1))
+
+            steps = max(1, int(sig.get("rl_epochs") or 1) * int(sig.get("rl_steps_per_epoch") or 1))
+            ref_steps = max(1, int(ref.get("rl_epochs") or 1) * int(ref.get("rl_steps_per_epoch") or 1))
+
+            paths = max(1, int(sig.get("rl_n_paths_eval") or 1) * seeds)
+            ref_paths = max(1, int(ref.get("rl_n_paths_eval") or 1) * ref_seeds)
+
+            # 단순 선형 스케일 + 혼합(학습 80%, 평가 20%)
+            scale_train = (steps * seeds) / max(1.0, ref_steps * ref_seeds)
+            scale_eval  = paths / max(1.0, ref_paths)
+            eta = base_time * (0.8 * scale_train + 0.2 * scale_eval)
+            return max(1.0, float(eta)), "history_rl"
+
+        # HJB / rule
+        seeds = max(1, int(sig.get("seeds") or 1))
+        ref_seeds = max(1, int(ref.get("seeds") or 1))
+        n_paths = int(sig.get("n_paths") or 0)
+        ref_paths = int(ref.get("n_paths") or 0)
+        scale = 1.0
+        if n_paths > 0 and ref_paths > 0:
+            scale = (n_paths * seeds) / (ref_paths * ref_seeds)
+        eta = base_time * scale
+        return max(1.0, float(eta)), "history_hjb"
+    except Exception:
+        return None, "scale_error"
+
+def _eta_record(args: argparse.Namespace, elapsed_s: float) -> None:
+    try:
+        path = _eta_db_path(args)
+        db = _eta_load_db(path)
+        db.append({
+            "ts": time.time(),
+            "time_total_s": float(elapsed_s),
+            "sig": _eta_signature(args),
+        })
+        _eta_save_db(path, db)
+    except Exception:
+        pass
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -130,19 +277,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--bequest_kappa", type=float, default=0.0)
     p.add_argument("--bequest_gamma", type=float, default=1.0)
 
-    # CVaR calibration (lambda) + 확장: calib_param, F 구간
+    # === CVaR Calibration (새 플래그 추가) ===
+    p.add_argument("--calib", choices=["on", "off"], default="off",
+                   help="on이면 캘리브레이션 모드로 진입(calibrate_lambda).")
+    p.add_argument("--calib_param", choices=["lambda", "F"], default="lambda",
+                   help="캘리브레이션 대상 파라미터 선택.")
     p.add_argument("--cvar_target", type=float, default=CVAR_TARGET_DEFAULT)
     p.add_argument("--cvar_tol", type=float, default=CVAR_TOL_DEFAULT)
     p.add_argument("--lambda_min", type=float, default=LAMBDA_MIN_DEFAULT)
     p.add_argument("--lambda_max", type=float, default=LAMBDA_MAX_DEFAULT)
     p.add_argument("--calib_fast", choices=["on", "off"], default="on")
     p.add_argument("--calib_max_iter", type=int, default=8)
-    p.add_argument("--calib_param", choices=["lambda", "F"], default="lambda",
-                   help="CVaR 캘리브레이션 대상 파라미터: lambda(기본) 또는 F(F_target 보정)")
-    p.add_argument("--F_min", type=float, default=None,
-                   help="calib_param=F일 때 탐색 하한(미지정시 F_target-0.5)")
-    p.add_argument("--F_max", type=float, default=None,
-                   help="calib_param=F일 때 탐색 상한(미지정시 F_target+0.5)")
+    p.add_argument("--F_min", type=float, default=None)
+    p.add_argument("--F_max", type=float, default=None)
 
     # autosave
     p.add_argument("--autosave", choices=["on", "off"], default="off")
@@ -189,36 +336,38 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--ann_index", choices=["real", "nominal"], default="real")
 
     # New: Bands / data window / profile / tag
-    p.add_argument("--bands", choices=["on", "off"], default="on",
-                   help="consumption bands 저장(on/off). off면 _bands 파일 미생성")
-    p.add_argument("--data_window", type=str, default=None,
-                   help="YYYY-MM:YYYY-MM 형식 (예: 2005-01:2020-12)")
-    p.add_argument("--data_profile", choices=["dev", "full"], default=None,
-                   help="market_csv 미지정 시 프로파일(dev/full)로 자동 설정")
-    p.add_argument("--tag", type=str, default=None,
-                   help="실험 태그(로그/metrics에 기록)")
+    p.add_argument("--bands", choices=["on", "off"], default="on")
+    p.add_argument("--data_window", type=str, default=None)
+    p.add_argument("--data_profile", choices=["dev", "full"], default=None)
+    p.add_argument("--tag", type=str, default=None)
 
-    # === NEW === 자산배분 & 환헤지 옵션 (run.py가 읽어 처리)
-    p.add_argument("--alpha_mix", type=str, default=None,
-                   help="자산배분 α=(KR,US,Au). 예: 'equal' 또는 '0.33,0.33,0.34'")
-    p.add_argument("--alpha_kr", type=float, default=None, help="KR 가중치(개별 지정 시)")
-    p.add_argument("--alpha_us", type=float, default=None, help="US 가중치(개별 지정 시)")
-    p.add_argument("--alpha_au", type=float, default=None, help="Gold 가중치(개별 지정 시)")
-    p.add_argument("--h_FX", type=float, default=None,
-                   help="US 주식 환헤지 비율 h∈[0,1] (예: 1=전헤지)")
-    p.add_argument("--fx_hedge_cost", type=float, default=None,
-                   help="연 환헤지 비용(기본 0.002=0.2%)")
+    # === 자산배분 & 환헤지 옵션
+    p.add_argument("--alpha_mix", type=str, default=None)
+    p.add_argument("--alpha_kr", type=float, default=None)
+    p.add_argument("--alpha_us", type=float, default=None)
+    p.add_argument("--alpha_au", type=float, default=None)
+    p.add_argument("--h_FX", type=float, default=None)
+    p.add_argument("--fx_hedge_cost", type=float, default=None)
 
-    # --- NEW: 표준출력 제어 ---
-    p.add_argument("--print_mode", choices=["full", "metrics", "summary"], default="full",
-                   help="stdout 출력 형태: full(원본), metrics(선택 지표만), summary(요약)")
-    p.add_argument("--metrics_keys", type=str, default="EW,ES95,Ruin,mean_WT,es_mode",
-                   help="print_mode=metrics|summary 에서 노출할 metrics 키(콤마구분)")
-    p.add_argument("--no_paths", action="store_true",
-                   help="stdout에서 extra.eval_WT/ruin_flags 등 대용량 배열 제거(길이만 남김)")
+    # --- 표준출력 제어 ---
+    p.add_argument("--print_mode", choices=["full", "metrics", "summary"], default="full")
+    p.add_argument("--metrics_keys", type=str, default="EW,ES95,Ruin,mean_WT,es_mode")
+    p.add_argument("--no_paths", action="store_true")
 
-    p.add_argument("--return_actor", choices=["on", "off"], default="off",
-                   help="on이면 run_rl이 (cfg, actor)를 반환하고 CLI가 재평가(CVaR 재계산) 수행")
+    p.add_argument("--return_actor", choices=["on", "off"], default="off")
+
+    # --- ETA 옵션 ---
+    p.add_argument("--eta_mode", choices=["off", "history"], default="history",
+                   help="실행 전 예상시간(ETA) 추정 모드. off면 비활성화")
+    p.add_argument("--eta_budget_hms", type=str, default=None,
+                   help="예산 시간(HH:MM:SS). 예측 ETA가 이를 넘으면 실행 중단(기본 hard stop).")
+    p.add_argument("--eta_budget_s", type=float, default=None,
+                   help="예산 시간(초). eta_budget_hms보다 우선.")
+    p.add_argument("--eta_hard_stop", choices=["on", "off"], default="on",
+                   help="on=예산 초과 시 즉시 종료, off=경고만")
+    p.add_argument("--eta_db", type=str, default=None,
+                   help="ETA 히스토리 DB 경로(기본 outputs/.eta_history.json)")
+
     return p
 
 
@@ -294,13 +443,11 @@ def _maybe_extract_WT(candidate: Any) -> Optional[Iterable[float]]:
 
 # --- ES95(CVaR) 보정 ---
 def _fixup_metrics_with_cvar(args: argparse.Namespace, out: Dict[str, Any]) -> Dict[str, Any]:
-    # metrics dict 위치 결정
     metrics = out["metrics"] if "metrics" in out and isinstance(out["metrics"], dict) else out
     es_mode = str(getattr(args, "es_mode", "wealth")).lower()
     F_target = float(getattr(args, "F_target", 0.0) or 0.0)
     alpha_v = float(getattr(args, "alpha", 0.95) or 0.95)
 
-    # wealth 모드에서는 재계산 대상 아님
     if es_mode != "loss" or F_target <= 0.0:
         metrics["es_mode"] = es_mode
         return out
@@ -312,7 +459,6 @@ def _fixup_metrics_with_cvar(args: argparse.Namespace, out: Dict[str, Any]) -> D
             break
 
     if WT is None:
-        # 의심 패턴(EW+ES95 ≈ F_target) 감지 시 메시지
         try:
             EW = float(metrics.get("EW", 0.0) or metrics.get("mean_WT", 0.0) or 0.0)
             ES_old = float(metrics.get("ES95", 0.0) or 0.0)
@@ -323,7 +469,6 @@ def _fixup_metrics_with_cvar(args: argparse.Namespace, out: Dict[str, Any]) -> D
         metrics["es_mode"] = es_mode
         return out
 
-    # CVaR 재계산
     try:
         import numpy as np
         WT_arr = np.asarray(list(WT), dtype=float)
@@ -359,7 +504,6 @@ def _estimate_n_paths(args: argparse.Namespace, out: Dict[str, Any]) -> Optional
             np_exist = out.get("n_paths")
             if isinstance(np_exist, (int, float)) and int(np_exist) > 0:
                 return int(np_exist)
-        # seeds 처리
         seeds = getattr(args, "seeds", [])
         if isinstance(seeds, int):
             n_seeds = 1
@@ -367,12 +511,10 @@ def _estimate_n_paths(args: argparse.Namespace, out: Dict[str, Any]) -> Optional
             n_seeds = max(1, len(seeds))
         else:
             n_seeds = 1
-        # 방법별 평가 경로
         if str(getattr(args, "method", "hjb")).lower() == "rl":
             n_eval = int(getattr(args, "rl_n_paths_eval", 0) or 0)
             if n_eval > 0:
                 return n_eval * n_seeds
-        # 기본 경로
         n_base = int(getattr(args, "n_paths", 0) or 0)
         if n_base > 0:
             return n_base * n_seeds
@@ -384,11 +526,10 @@ def _estimate_n_paths(args: argparse.Namespace, out: Dict[str, Any]) -> Optional
 # --- 표준출력 축소/요약 도우미 ---
 def _prune_for_stdout(args: argparse.Namespace, out: Dict[str, Any]) -> Any:
     def _sel_metrics(md: Dict[str, Any], keys: Iterable[str]) -> Dict[str, Any]:
-        return {k: md[k] for k in keys if k in md}
+        return {k: md[k] for k in md if k in keys}
 
-    # 대용량 경로 제거 옵션
     if args.no_paths and isinstance(out, dict):
-        out = dict(out)  # shallow copy
+        out = dict(out)
         extra = out.get("extra")
         if isinstance(extra, dict):
             for k in ("eval_WT", "ruin_flags"):
@@ -404,11 +545,9 @@ def _prune_for_stdout(args: argparse.Namespace, out: Dict[str, Any]) -> Any:
     if mode == "full":
         return out
 
-    # metrics 사전 찾기
     metrics = out["metrics"] if isinstance(out, dict) and isinstance(out.get("metrics"), dict) else out
     keys = [s.strip() for s in str(getattr(args, "metrics_keys", "")).split(",") if s.strip()]
 
-    # 공통 메타 필드 추정
     n_paths_guess = _estimate_n_paths(args, out)
     age0_guess = None
     sex_guess = None
@@ -425,7 +564,6 @@ def _prune_for_stdout(args: argparse.Namespace, out: Dict[str, Any]) -> Any:
 
     if mode == "metrics":
         mini = _sel_metrics(metrics, keys)
-        # 타이밍도 같이 내려줌
         if isinstance(out, dict):
             mini["time_total_s"] = out.get("time_total_s")
             mini["time_total_hms"] = out.get("time_total_hms")
@@ -448,7 +586,6 @@ def _prune_for_stdout(args: argparse.Namespace, out: Dict[str, Any]) -> Any:
             "metrics": _sel_metrics(metrics, keys),
             "n_paths": n_paths_guess,
             "T": (out.get("extra") or {}).get("T") if isinstance(out, dict) else None,
-            # CLI 총 실행시간
             "time_total_s": out.get("time_total_s") if isinstance(out, dict) else None,
             "time_total_hms": out.get("time_total_hms") if isinstance(out, dict) else None,
         }
@@ -457,7 +594,6 @@ def _prune_for_stdout(args: argparse.Namespace, out: Dict[str, Any]) -> Any:
 
 
 def _maybe_evaluate_with_es_mode(res: Any, es_mode: str) -> Dict[str, Any]:
-    # (metrics, extras) 튜플을 그대로 받은 경우 처리
     if isinstance(res, tuple) and len(res) >= 1 and isinstance(res[0], dict):
         pack = {"metrics": res[0]}
         if len(res) >= 2 and isinstance(res[1], dict):
@@ -466,9 +602,6 @@ def _maybe_evaluate_with_es_mode(res: Any, es_mode: str) -> Dict[str, Any]:
             pack["metrics"]["es_mode"] = str(es_mode).lower()
         return pack
 
-    """run_* 결과가 dict면 그대로 사용.
-    (cfg, actor) 형태면 evaluate(cfg, actor, es_mode=...) 호출 → dict로 변환.
-    """
     # 이미 최종 dict
     if isinstance(res, dict):
         if "es_mode" not in res:
@@ -492,14 +625,12 @@ def _maybe_evaluate_with_es_mode(res: Any, es_mode: str) -> Dict[str, Any]:
             except TypeError:
                 m = evaluate(cfg, actor, es_mode=str(es_mode).lower())  # type: ignore
 
-            # (metrics, extras) or dict
             if isinstance(m, tuple) and len(m) >= 1 and isinstance(m[0], dict):
                 pack: Dict[str, Any] = {"metrics": m[0]}
                 if len(m) >= 2:
-                    pack["extra"] = m[1]  # extras['eval_WT'] 등 보관
+                    pack["extra"] = m[1]
                 if "es_mode" not in pack["metrics"]:
                     pack["metrics"]["es_mode"] = str(es_mode).lower()
-                # cfg에서 몇 가지 편의 필드 복사(있을 때만)
                 for k in ("asset", "method", "w_max", "fee_annual", "lambda_term", "alpha", "F_target", "outputs", "tag"):
                     try:
                         pack[k] = getattr(cfg, k)
@@ -512,7 +643,6 @@ def _maybe_evaluate_with_es_mode(res: Any, es_mode: str) -> Dict[str, Any]:
                     m["es_mode"] = str(es_mode).lower()
                 return m
 
-    # evaluate 사용 불가 → 최소 정보 래핑
     return {
         "result": "ok",
         "note": "evaluate not executed in cli (no evaluate import or unexpected return type).",
@@ -534,19 +664,49 @@ def main():
     _apply_data_profile_defaults(args)
     _validate_args(args)
 
-    # route
-    if args.method == "rl":
-        res = run_rl(args)
-        out = _maybe_evaluate_with_es_mode(res, es_mode=getattr(args, "es_mode", "wealth"))
-    elif args.method == "hjb" and (args.cvar_target is not None):
+    # === ETA: 실행 전 예측 & 예산 검사 (STDERR로만 출력) ===
+    try:
+        if getattr(args, "eta_mode", "history") == "history":
+            db = _eta_load_db(_eta_db_path(args))
+            eta_s, src = _eta_predict_from_history(args, db)
+            if eta_s is not None:
+                print(f"[ETA] ~{_fmt_hms(eta_s)} (source={src}) … starting", file=sys.stderr, flush=True)
+
+                # 예산 체크
+                budget = getattr(args, "eta_budget_s", None)
+                if budget is None:
+                    budget = _parse_hms_to_seconds(getattr(args, "eta_budget_hms", None))
+                if budget is not None and eta_s > float(budget):
+                    if str(getattr(args, "eta_hard_stop", "on")).lower() == "on":
+                        print(f"[ETA] exceeds budget {_fmt_hms(budget)} → abort.", file=sys.stderr, flush=True)
+                        sys.exit(3)
+                    else:
+                        print(f"[ETA] exceeds budget {_fmt_hms(budget)} → continue (soft-warn).",
+                              file=sys.stderr, flush=True)
+            # 히스토리 없으면 조용히 진행
+    except Exception as _e:
+        # ETA는 기능 보조이므로 에러 무시
+        print(f"[ETA] predictor skipped ({type(_e).__name__})", file=sys.stderr, flush=True)
+
+    # === 캘리브레이션 분기 ===
+    #   - 명시적으로 --calib on 일 때만 calibrate_lambda 진입
+    #   - --calib_param F|lambda 에 따라 F 또는 λ 보정 (calibrate.py에서 처리)
+    if getattr(args, "calib", "off") == "on":
         out = calibrate_lambda(args)
+        # calibrate_lambda는 내부에서 es_mode=loss 재계산을 강제하므로,
+        # 여기서는 단순 pass. 필요 시 표준 키 보정만 수행.
         if isinstance(out, dict) and "es_mode" not in out:
             out["es_mode"] = str(getattr(args, "es_mode", "wealth")).lower()
     else:
-        res = run_once(args)
-        out = _maybe_evaluate_with_es_mode(res, es_mode=getattr(args, "es_mode", "wealth"))
+        # === 일반 실행 경로 ===
+        if args.method == "rl":
+            res = run_rl(args)
+            out = _maybe_evaluate_with_es_mode(res, es_mode=getattr(args, "es_mode", "wealth"))
+        else:
+            res = run_once(args)
+            out = _maybe_evaluate_with_es_mode(res, es_mode=getattr(args, "es_mode", "wealth"))
 
-    # ES95(CVaR) 보정
+    # ES95(CVaR) 보정(wealth→loss 경로레벨 재계산; WT 없으면 스킵)
     try:
         if isinstance(out, dict):
             out = _fixup_metrics_with_cvar(args, out)
@@ -564,7 +724,13 @@ def main():
         out["time_total_s"] = round(elapsed, 3)
         out["time_total_hms"] = _fmt_hms(elapsed)
 
-    # 표준출력 제어 적용
+    # ETA 히스토리 갱신
+    try:
+        _eta_record(args, elapsed)
+    except Exception:
+        pass
+
+    # 표준출력 제어
     to_print = _prune_for_stdout(args, out) if isinstance(out, dict) else out
     print(json.dumps(to_print, ensure_ascii=False))
 
