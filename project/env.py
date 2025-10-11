@@ -1,9 +1,14 @@
 # project/env.py
+from __future__ import annotations
+
 import numpy as _np
+from numpy.random import Generator as _Generator, default_rng as _default_rng, SeedSequence as _SeedSequence
 from typing import Optional, Tuple, Dict, Any
+
 from .config import SimConfig
 from .market import IIDNormalMarket, BootstrapMarket
 from .mortality import MortalitySampler
+
 
 class RetirementEnv:
     """
@@ -25,17 +30,45 @@ class RetirementEnv:
           * mode="sigma": per-period σ reduction (R_t ← μ_m + (1-k)·(R_t - μ_m))
     """
 
-    def __init__(self, cfg: SimConfig):
+    def __init__(
+        self,
+        cfg: SimConfig,
+        rng: Optional[_Generator] = None,          # env 내부 난수
+        market_rng: Optional[_Generator] = None,   # 마켓 백엔드 난수
+    ):
         self.cfg = cfg
         self.m = cfg.monthly()  # {'mu_m','sigma_m','rf_m','phi_m','p_m','g_m','beta_m'}
         self.T = int(cfg.horizon_years) * int(cfg.steps_per_year)
 
-        # Market backend (fallback)
+        # ----- RNG 배선: base_seed → [env, market] 서브스트림 분리 -----
+        base_seed = getattr(cfg, "seed", None)
+        self._rng: _Generator
+        self._rng_market: Optional[_Generator]
+
+        if rng is not None or market_rng is not None:
+            # 외부에서 직접 주입 시 그대로 사용
+            self._rng = rng or _default_rng()
+            self._rng_market = market_rng
+        else:
+            # cfg.seed가 있으면 재현 가능하게, 없으면 비결정적
+            if base_seed is not None:
+                ss = _SeedSequence(int(base_seed))
+                env_ss, mkt_ss = ss.spawn(2)
+                self._rng = _default_rng(env_ss)
+                self._rng_market = _default_rng(mkt_ss)
+            else:
+                self._rng = _default_rng()
+                self._rng_market = None
+
+        # Market backend (iid / bootstrap)
         mode = str(getattr(cfg, "market_mode", "iid")).lower()
         if mode == "bootstrap":
-            self.market = BootstrapMarket(cfg)
+            self.market = BootstrapMarket(cfg)  # 시장 쪽에 rng 주입 시도는 아래에서 처리
         else:
             self.market = IIDNormalMarket(cfg)
+
+        # 가능하면 market에 RNG 주입(라이브러리 호환성 고려)
+        self._try_wire_market_rng(self._rng_market)
 
         # Hedge params (monthly)
         self._hedge_on: bool = bool(getattr(cfg, "hedge_on", getattr(cfg, "hedge", "off") == "on"))
@@ -48,7 +81,7 @@ class RetirementEnv:
         self._mu_m: float = float(self.m["mu_m"])
 
         # Mortality
-        mort_flag = str(getattr(cfg, "mortality", "off")).lower() == "on" or bool(getattr(cfg, "mortality_on", False))
+        mort_flag = (str(getattr(cfg, "mortality", "off")).lower() == "on") or bool(getattr(cfg, "mortality_on", False))
         self.mortality_on = bool(mort_flag)
         self.age0 = int(getattr(cfg, "age0", 65))
         self.sex  = str(getattr(cfg, "sex", "M"))
@@ -67,12 +100,59 @@ class RetirementEnv:
         )
         self._boot_block  = int(getattr(cfg, "bootstrap_block", 24) or 24)
 
-        # Episode RNG & paths
-        self._rng: _np.random.Generator = _np.random.default_rng()
+        # Paths
         self.path_risky: _np.ndarray = _np.zeros(self.T, dtype=float)
         self.path_safe:  _np.ndarray = _np.zeros(self.T, dtype=float)
 
         self.reset()
+
+    # --------------------
+    # RNG wiring helpers
+    # --------------------
+    def _try_wire_market_rng(self, rng: Optional[_Generator]) -> None:
+        """가능하면 market 쪽에 RNG를 주입. (호환성: seed()/rng 속성/인자)"""
+        if rng is None:
+            # cfg.seed만 있는 경우 market이 자체 seed 메서드를 지원하면 그걸로 초기화
+            seed = getattr(self.cfg, "seed", None)
+            if seed is not None and hasattr(self.market, "seed"):
+                try:
+                    self.market.seed(int(seed))
+                except Exception:
+                    pass
+            return
+
+        # 우선순위: 속성 할당 → set_rng 메서드 → seed 대체
+        try:
+            setattr(self.market, "rng", rng)
+            return
+        except Exception:
+            pass
+        if hasattr(self.market, "set_rng"):
+            try:
+                self.market.set_rng(rng)
+                return
+            except Exception:
+                pass
+        # 마지막 수단: seed 메서드가 있으면 엔트로피 추출해 정수 seed로 설정
+        if hasattr(self.market, "seed"):
+            try:
+                # Generator는 .bit_generator.state['state'] 가 있으나 구현 의존적 → 간단히 정수 추출
+                tmp = _default_rng().integers(0, 2**31 - 1, dtype=_np.int64)
+                self.market.seed(int(tmp))
+            except Exception:
+                pass
+
+    def reseed(self, base_seed: Optional[int]) -> None:
+        """런 타임에 base_seed로 env/market RNG를 재구성."""
+        if base_seed is None:
+            self._rng = _default_rng()
+            self._rng_market = None
+        else:
+            ss = _SeedSequence(int(base_seed))
+            env_ss, mkt_ss = ss.spawn(2)
+            self._rng = _default_rng(env_ss)
+            self._rng_market = _default_rng(mkt_ss)
+        self._try_wire_market_rng(self._rng_market)
 
     # --------------------
     # internals
@@ -85,7 +165,7 @@ class RetirementEnv:
         # sigma-mode: shrink deviations around μ_m
         return self._mu_m + (1.0 - self._hedge_sigma_k) * (r_path - self._mu_m)
 
-    def _make_mbb_path(self, rng: _np.random.Generator, series: _np.ndarray, T: int, B: int) -> _np.ndarray:
+    def _make_mbb_path(self, rng: _Generator, series: _np.ndarray, T: int, B: int) -> _np.ndarray:
         """Moving-Block Bootstrap로 길이 T 경로 생성."""
         arr = _np.asarray(series, dtype=float)
         n = int(arr.shape[0])
@@ -108,18 +188,10 @@ class RetirementEnv:
     # --------------------
     # API
     # --------------------
-    def reset(self, seed: Optional[int] = None, W0: float = 1.0) -> Dict:
+    def reset(self, seed: Optional[int] = None, W0: float = 1.0) -> Dict[str, Any]:
         # reseed (internal RNG + backend)
         if seed is not None:
-            try:
-                self._rng = _np.random.default_rng(int(seed))
-            except Exception:
-                self._rng = _np.random.default_rng()
-            if hasattr(self.market, "seed"):
-                try:
-                    self.market.seed(int(seed))
-                except Exception:
-                    pass
+            self.reseed(int(seed))
 
         self.t = 0
         self.W = float(W0)
@@ -170,7 +242,7 @@ class RetirementEnv:
         return self._obs()
 
     def step(self, q: float, w: float) -> Tuple[Dict, float, bool, bool, Dict]:
-        info: Dict = {}
+        info: Dict[str, Any] = {}
 
         # 1) clipping
         w = float(_np.clip(float(w), 0.0, self.cfg.w_max))

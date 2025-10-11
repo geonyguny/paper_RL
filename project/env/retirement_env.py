@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import os, math
 
-# ---------- helpers ----------
+# ---------- small helpers ----------
 def _clip01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
 
@@ -17,7 +17,7 @@ def _crra_u(c: float, gamma: float) -> float:
     return (c**(1.0 - gamma) - 1.0) / (1.0 - gamma)
 
 def _to_monthly_rate_like(x: np.ndarray) -> np.ndarray:
-    """지수로 보이면 전월대비율로 변환, 아니면 그대로(월간률 가정)."""
+    """지수형(레벨)로 보이면 전월대비율로 변환, 아니면 그대로(월간률 가정)."""
     x = np.asarray(x, dtype=float)
     is_index_like = (np.nanmax(x) > 5.0) or (np.nanmedian(np.abs(x)) > 0.2)
     if is_index_like and x.size >= 2:
@@ -27,6 +27,10 @@ def _to_monthly_rate_like(x: np.ndarray) -> np.ndarray:
         return r
     return x.astype(float)
 
+def _safe_nan_to_num(a: np.ndarray, fill: float = 0.0) -> np.ndarray:
+    return np.nan_to_num(np.asarray(a, dtype=float), nan=fill, posinf=fill, neginf=fill)
+
+# ---------- CSV loader (no RNG fallback here) ----------
 def _load_market_arrays(csv_path: str, use_real_rf: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     CSV columns (required): date, risky_nom, tbill_nom, cpi
@@ -35,38 +39,26 @@ def _load_market_arrays(csv_path: str, use_real_rf: str) -> Tuple[np.ndarray, np
       risky    : 월간 위험자산 수익률 (use_real_rf='on'이면 실질, 아니면 명목)
       safe     : 월간 무위험자산 수익률 (동일 규칙)
       cpi_rate : 월간 CPI 상승률(월간률)
-
-    use_real_rf == 'on'이면 risky/safe를 CPI로 실질화.
     """
-    try:
-        data = np.genfromtxt(csv_path, delimiter=',', names=True, dtype=None, encoding='utf-8')
-        names = {n.lower() for n in (data.dtype.names or ())}
-        required = {'risky_nom', 'tbill_nom', 'cpi'}
-        if not required.issubset(names):
-            raise ValueError(f"CSV missing columns: {sorted(required - names)}")
+    data = np.genfromtxt(csv_path, delimiter=',', names=True, dtype=None, encoding='utf-8')
+    names = {n.lower() for n in (data.dtype.names or ())}
+    required = {'risky_nom', 'tbill_nom', 'cpi'}
+    if not required.issubset(names):
+        raise ValueError(f"CSV missing columns: {sorted(required - names)}")
 
-        risky_nom = np.asarray(data['risky_nom'], dtype=float)
-        tbill_nom = np.asarray(data['tbill_nom'], dtype=float)
-        cpi_col   = np.asarray(data['cpi'],       dtype=float)
+    risky_nom = _safe_nan_to_num(data['risky_nom'])
+    tbill_nom = _safe_nan_to_num(data['tbill_nom'])
+    cpi_col   = _safe_nan_to_num(data['cpi'])
 
-        cpi_rate = _to_monthly_rate_like(np.nan_to_num(cpi_col, nan=0.0))
+    cpi_rate = _to_monthly_rate_like(cpi_col)
 
-        if str(use_real_rf).lower() == 'on':
-            risky = (1.0 + np.nan_to_num(risky_nom, nan=0.0)) / (1.0 + cpi_rate) - 1.0
-            safe  = (1.0 + np.nan_to_num(tbill_nom, nan=0.0)) / (1.0 + cpi_rate) - 1.0
-        else:
-            risky = np.nan_to_num(risky_nom, nan=0.0)
-            safe  = np.nan_to_num(tbill_nom, nan=0.0)
+    if str(use_real_rf).lower() == 'on':
+        risky = (1.0 + risky_nom) / (1.0 + cpi_rate) - 1.0
+        safe  = (1.0 + tbill_nom) / (1.0 + cpi_rate) - 1.0
+    else:
+        risky, safe = risky_nom, tbill_nom
 
-        return risky.astype(float), safe.astype(float), cpi_rate.astype(float)
-    except Exception:
-        # 안전한 최종 fallback (parametric i.i.d.) + CPI=0%
-        rng = np.random.default_rng(7)
-        risky = rng.normal(0.06/12, 0.18/np.sqrt(12), size=6000)
-        safe  = np.full(6000, 0.02/12)
-        cpi_rate = np.zeros(6000, dtype=float)
-        return risky, safe, cpi_rate
-
+    return risky.astype(float), safe.astype(float), cpi_rate.astype(float)
 
 # ---------- Environment ----------
 class RetirementEnv:
@@ -77,11 +69,11 @@ class RetirementEnv:
       - order: clip -> consume -> returns(+hedge) -> fee -> reward
 
     Notes
-    - __init__는 cfg 객체 **또는** 키워드 인자(**kwargs)** 둘 다 지원.
-    - step()은 Gymnasium 스타일 **5-튜플** 반환: (obs, reward, done, trunc, info).
-    - 헤지 비용은 '헤지 발동(hedge_active=True)'인 스텝에만 1회 차감.
-    - 연초 플래그/인플레 연율 노출: self.is_new_year, self.cpi_yoy
-    - [ANN] 연금 오버레이: t=0에 1회 매입(P 차감) 후, 월 고정지급 self.y_ann을 소비에 **가산**(자산 W에서 차감하지 않음).
+    - __init__는 cfg 객체 또는 키워드 인자(**kwargs) 모두 지원.
+    - step()은 Gymnasium 스타일 5-튜플 반환: (obs, reward, done, trunc, info).
+    - 헤지 비용은 '실제 헤지 동작'이 있을 때에만 1회 차감.
+    - 연초 플래그/인플레 YoY 노출: self.is_new_year, self.cpi_yoy
+    - [ANN] 연금 오버레이: t=0에 1회 매입(P 차감) 후, 월 고정지급 self.y_ann을 소비에 가산(자산 W에서 차감하지 않음).
     """
 
     # --- cfg/kwargs 통합 접근자 ---
@@ -117,7 +109,7 @@ class RetirementEnv:
         self.ann_P = 0.0
         self.ann_a_factor = 0.0
 
-        # --- demo용 나이 메타 (정책/로깅에서 사용) ---
+        # --- demo용 나이 메타 ---
         self.age0 = int(self._get(cfg, kwargs, 'age0', 65))
         self.age_years = float(self.age0)  # reset/step에서 갱신
 
@@ -158,22 +150,36 @@ class RetirementEnv:
         else:
             seeds = self._get(cfg, kwargs, "seeds", [0]) or [0]
             self.seed_base = int(seeds[0] if len(seeds) > 0 else 0)
+
+        # master SeedSequence (고정) & 카운터(에피소드마다 증가)
+        self._ss_master = np.random.SeedSequence(self.seed_base)
         self._path_counter = 0  # increments each reset for iid reproducibility
 
         # --- preload market arrays ---
         if self.market_mode == 'bootstrap' and os.path.exists(self.market_csv):
-            self._risky, self._safe, self._cpi_rate = _load_market_arrays(self.market_csv, self.use_real_rf)
+            try:
+                self._risky, self._safe, self._cpi_rate = _load_market_arrays(self.market_csv, self.use_real_rf)
+            except Exception:
+                # CSV가 있지만 읽기 실패 → 파라메트릭 경로로 대체(재현성 보장)
+                self._risky, self._safe, self._cpi_rate = self._make_parametric_bank(6000)
         else:
-            rng = np.random.default_rng(7)
-            self._risky = rng.normal(0.06/12, 0.18/np.sqrt(12), size=6000)
-            self._safe  = np.full(6000, 0.02/12)
-            self._cpi_rate = np.zeros(6000, dtype=float)  # CPI 없으면 0%
+            # CSV가 없거나 iid 모드 등 → 파라메트릭 경로 (재현성 보장)
+            self._risky, self._safe, self._cpi_rate = self._make_parametric_bank(6000)
 
         # ---- yearly flags (연초 트리거 & CPI YoY) ----
         self.is_new_year: bool = True
         self.cpi_yoy: float = 0.0  # 최근 12개월 누적 인플레율
 
         self.reset()
+
+    def _make_parametric_bank(self, n: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """CSV가 없거나 실패할 때 사용할 파라메트릭(i.i.d.) 시계열(재현성 보장)."""
+        # master에서 한 번만 파생된 RNG로 생성(고정 bank) — seed가 같으면 동일 bank
+        rng = np.random.default_rng(self._ss_master.spawn(1)[0])
+        risky = rng.normal(0.06/12, 0.18/np.sqrt(12), size=int(n))
+        safe  = np.full(int(n), 0.02/12, dtype=float)
+        cpi   = np.zeros(int(n), dtype=float)  # CPI 없으면 0%
+        return risky.astype(float), safe.astype(float), cpi.astype(float)
 
     # ----- mortality init -----
     def _init_mortality_if_any(self, cfg: Any, kwargs: dict):
@@ -221,6 +227,7 @@ class RetirementEnv:
 
     # ----- market path builders -----
     def _bootstrap_path(self, T:int, rng:np.random.Generator) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Moving-block bootstrap from preloaded banks (risky/safe/cpi)."""
         N = len(self._risky)
         B = max(1, self.bootstrap_block)
         r = np.empty(T, float); s = np.empty(T, float); p = np.empty(T, float)
@@ -280,15 +287,21 @@ class RetirementEnv:
         self.ann_P = 0.0
         self.ann_a_factor = 0.0
 
-        rng_seed = int(seed) if (seed is not None) else (self.seed_base + self._path_counter)
-        rng = np.random.default_rng(rng_seed)
+        # --- 에피소드 RNG: master SeedSequence에서 path별 서브시드 파생 ---
+        if seed is not None:
+            ss = np.random.SeedSequence(int(seed))
+        else:
+            # path_counter를 사용해 매 reset마다 고유 서브시드 보장(같은 base면 재현)
+            ss = self._ss_master.spawn(self._path_counter + 1)[-1]
+        rng = np.random.default_rng(ss)
         self._path_counter += 1
 
         if self.market_mode == 'bootstrap':
             self.path_risky, self.path_safe, self.path_cpi = self._bootstrap_path(self.T, rng)
         else:
-            self.path_risky = rng.normal(0.06/12, 0.18/np.sqrt(12), size=self.T)
-            self.path_safe  = np.full(self.T, 0.02/12)
+            # iid: 파라메트릭(지정 RNG)로 직접 생성
+            self.path_risky = rng.normal(0.06/12, 0.18/np.sqrt(12), size=self.T).astype(float)
+            self.path_safe  = np.full(self.T, 0.02/12, dtype=float)
             self.path_cpi   = np.zeros(self.T, dtype=float)  # iid 모드 기본 CPI=0%
 
         # --- [ANN] t=0 한 번 매입 → W 차감 / y_ann 설정
@@ -309,6 +322,7 @@ class RetirementEnv:
         """헤지 모드/강도에 따른 r_risky_eff와 hedge_active 플래그를 계산."""
         k = float(max(0.0, min(1.0, float(getattr(self, "hedge_sigma_k", 0.0)))))
         mode = str(getattr(self, "hedge_mode", "sigma")).lower()
+
         r_pos = max(r_risky_raw, 0.0)
         r_neg = min(r_risky_raw, 0.0)
 
@@ -317,9 +331,11 @@ class RetirementEnv:
 
         if str(getattr(self, "hedge", "off")).lower() == "on":
             if mode == "sigma":
+                # 위험자산/무위험자산 convex mix
                 r_risky_eff = (1.0 - k) * r_risky_raw + k * r_safe
                 hedge_active = True
             elif mode in ("downside", "down"):
+                # 하락 구간만 완화 (상승은 그대로)
                 if r_risky_raw < 0.0 and k > 0.0:
                     r_risky_eff = r_pos + (1.0 - k) * r_neg
                     hedge_active = True
@@ -370,13 +386,13 @@ class RetirementEnv:
         q = max(float(getattr(self, "q_floor", 0.0) or 0.0), _clip01(q))
         w = _clip01(min(w, float(getattr(self, "w_max", 1.0))))
 
-        # 2) consumption  ---------------------------------------------------
+        # 2) consumption
         y_ann = float(getattr(self, "y_ann", 0.0) or 0.0)   # [ANN]
         c = y_ann + q * self.W
-        # 연금은 외부 유입(보험), 자산 W에서 차감하지 않음.
+        # 연금은 외부 유입이므로 자산에서 차감하지 않음.
         W_after_c = max(self.W - q * self.W, 0.0)
 
-        # 3) returns (with optional hedge) ----------------------------------
+        # 3) returns (with optional hedge)
         r_risky_raw = float(self.path_risky[self.t])
         r_safe      = float(self.path_safe[self.t])
 
@@ -393,7 +409,7 @@ class RetirementEnv:
         gross = 1.0 + r_port
         W_after_ret = W_after_c * gross
 
-        # 4) 운용 수수료 (소비→수익률→fee 순서 유지) -------------------------
+        # 4) 운용 수수료 (소비→수익률→fee 순서 유지)
         fee_m = float(getattr(self, "fee_m", 0.0))
         fee = fee_m * W_after_ret
         self.W = max(W_after_ret - fee, 0.0)
@@ -404,7 +420,7 @@ class RetirementEnv:
         survive_bonus = float(getattr(self, "survive_bonus", 0.0))
         reward = u_scale * _crra_u(c, gamma) + survive_bonus
 
-        # advance time & termination ----------------------------------------
+        # advance time & termination
         self.t += 1
 
         # --- 나이 & 연초 플래그 ---

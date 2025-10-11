@@ -2,10 +2,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os, csv, datetime, inspect
+import os
+import csv
+import datetime
+import inspect
+from typing import Callable, Tuple, Optional, Dict, Any, Union, List
+
 import numpy as _np
 import pandas as pd
-from typing import Callable, Tuple, Optional, Dict, Any, Union
 
 from .env import RetirementEnv
 
@@ -57,74 +61,6 @@ def _reset_env(env: RetirementEnv, seed: int) -> None:
                 pass
 
 
-def _has_life_table(env: RetirementEnv) -> bool:
-    lt = getattr(env, "life_table", None)
-    if isinstance(lt, pd.DataFrame) and not lt.empty:
-        return True
-    lt2 = getattr(env, "mort_table_df", None)
-    return isinstance(lt2, pd.DataFrame) and not lt2.empty
-
-
-def _get_life_table(env: RetirementEnv) -> Optional[pd.DataFrame]:
-    lt = getattr(env, "life_table", None)
-    if isinstance(lt, pd.DataFrame) and not lt.empty:
-        return lt
-    lt2 = getattr(env, "mort_table_df", None)
-    if isinstance(lt2, pd.DataFrame) and not lt2.empty:
-        return lt2
-    return None
-
-
-def _annual_q_from_row(row: pd.Series) -> float:
-    """life_table 한 행에서 annual qx를 안전하게 꺼낸다."""
-    if "qx" in row.index:
-        q = float(row["qx"])
-    elif "px" in row.index or "Px" in row.index:
-        col = "px" if "px" in row.index else "Px"
-        q = 1.0 - float(row[col])
-    else:
-        raise KeyError("life_table row must have 'qx' or 'px/Px'")
-    if not _np.isfinite(q):
-        q = 0.0
-    return float(min(max(q, 0.0), 1.0 - 1e-12))
-
-
-def _monthly_q_from_annual(q_annual: float, spm: int) -> float:
-    """연간 q(사망확률) -> 월간 q_m 변환."""
-    qm = 1.0 - (1.0 - float(q_annual)) ** (1.0 / max(spm, 1))
-    return float(min(max(qm, 0.0), 1.0 - 1e-12))
-
-
-def _sample_death_month(
-    age0: int,
-    spm: int,
-    life_df: pd.DataFrame,
-    rng: _np.random.Generator,
-    max_extra_years: int = 60,
-) -> Optional[int]:
-    """생명표 기반 사망월 표본추출. 반환: death_m 또는 None(장수)"""
-    if life_df is None or life_df.empty:
-        return None
-    df = life_df.copy()
-    df["age"] = df["age"].astype(int)
-    df = df.sort_values("age").set_index("age")
-    a_min, a_max = int(df.index.min()), int(df.index.max())
-
-    age = int(age0)
-    month = 0
-    hard_cap = (max_extra_years + (a_max - age0) + 1) * spm
-
-    while month < hard_cap:
-        a_clamp = int(min(max(age, a_min), a_max))
-        q_m = _monthly_q_from_annual(_annual_q_from_row(df.loc[a_clamp]), spm)
-        if rng.random() < q_m:
-            return month
-        month += 1
-        if (month % spm) == 0:
-            age += 1
-    return None
-
-
 # =========================
 # Core episode
 # =========================
@@ -135,7 +71,7 @@ def run_episode(
     seed: int = 0,
 ) -> Tuple[_np.ndarray, _np.ndarray, bool, dict[str, float]]:
     """
-    한 에피소드 실행(사망표본이 있으면 사망월에 조기종결).
+    한 에피소드 실행.
     Returns:
         W_hist: 월별 W
         C_hist: 월별 소비
@@ -144,21 +80,8 @@ def run_episode(
     """
     _reset_env(env, seed=seed)
 
-    # mortality: death month sampling (optional)
-    death_m: Optional[int] = None
-    mort_on = str(getattr(env, "mortality", getattr(env, "mortality_on", "off"))).lower()
-    if (mort_on == "on") and _has_life_table(env):
-        spm = int(getattr(env, "steps_per_year", 12) or 12)
-        age0 = int(getattr(env, "age0", 65) or 65)
-        lt = _get_life_table(env)
-        rng = _np.random.default_rng(int(seed) + 17)  # decoupled reproducible stream
-        try:
-            death_m = _sample_death_month(age0, spm, lt, rng)
-        except Exception:
-            death_m = None  # safe fallback
-
-    W_hist: list[float] = []
-    C_hist: list[float] = []
+    W_hist: List[float] = []
+    C_hist: List[float] = []
     early_hit = False
 
     # hedge counters
@@ -166,10 +89,7 @@ def run_episode(
     hedge_k_sum = 0.0
     hedge_active_w_sum = 0.0
 
-    for i in range(env.T):
-        if (death_m is not None) and (i >= death_m):  # death reached: stop
-            break
-
+    for _ in range(env.T):
         state = env._obs()
         q, w = actor(state)
         _, _, done, _, info = env.step(q=q, w=w)
@@ -178,7 +98,7 @@ def run_episode(
         C_hist.append(float((info or {}).get("consumption", 0.0)))
 
         # ruin (separate from death)
-        if env.W <= 0.0 and i < env.T - 1:
+        if env.W <= 0.0 and not done:
             early_hit = True
 
         # hedge stats
@@ -197,7 +117,7 @@ def run_episode(
         "hedge_k_sum": float(hedge_k_sum),
         "hedge_active_w_sum": float(hedge_active_w_sum),
     }
-    return _np.array(W_hist, dtype=float), _np.array(C_hist, dtype=float), bool(early_hit), ep_stats
+    return _np.asarray(W_hist, dtype=float), _np.asarray(C_hist, dtype=float), bool(early_hit), ep_stats
 
 
 # =========================
@@ -206,31 +126,39 @@ def run_episode(
 
 def metrics_wealth(WT_samples: _np.ndarray, alpha: float = 0.95) -> Dict[str, float]:
     """ES95 = 하위 (1-α) 분위수 이하의 평균(부(-) 꼬리 평균 아님: 자산 관점)."""
-    EW = float(WT_samples.mean())
-    q = _np.quantile(WT_samples, 1.0 - alpha)  # 5th pct of wealth
-    tail = WT_samples[WT_samples <= q]
+    WT = _np.asarray(WT_samples, dtype=float)
+    if WT.size == 0:
+        return dict(EW=0.0, ES95=0.0)
+    EW = float(WT.mean())
+    q = _np.quantile(WT, 1.0 - alpha)  # 5th pct of wealth
+    tail = WT[WT <= q]
     ES_tail_mean = float(tail.mean()) if tail.size > 0 else float(q)
     return dict(EW=EW, ES95=ES_tail_mean)
 
 
 def metrics_loss(WT_samples: _np.ndarray, F: float = 1.0, alpha: float = 0.95) -> Dict[str, float]:
     """Loss = max(F − W_T, 0). ES95는 손실분포의 α-조건부기대치(CVaR_α)."""
-    L = _np.maximum(F - WT_samples, 0.0)
+    WT = _np.asarray(WT_samples, dtype=float)
+    if WT.size == 0:
+        return dict(EW=0.0, EL=0.0, ES95=0.0)
+    L = _np.maximum(F - WT, 0.0)
     EL = float(L.mean())
+    # 간단 표본식(CVaR): α-VaR 이상 꼬리의 평균
     qL = _np.quantile(L, alpha)      # VaR_α
     tail = L[L >= qL]
     ES = float(tail.mean()) if tail.size > 0 else float(qL)
-    return dict(EW=float(WT_samples.mean()), EL=EL, ES95=ES)
+    return dict(EW=float(WT.mean()), EL=EL, ES95=ES)
 
 
 # =========================
-# Evaluation (wealth/loss + consumption bands + mortality)
+# Evaluation (wealth/loss + consumption bands)
 # =========================
 
 def evaluate(
     cfg: Any,
     actor,
     es_mode: str = "wealth",
+    rng=None,                  # (호환성 유지용, 미사용)
     return_paths: bool = False,
 ) -> Union[Dict[str, float], Tuple[Dict[str, float], Dict[str, Any]]]:
     """
@@ -271,9 +199,9 @@ def evaluate(
         except Exception:
             pass
 
-    WT: list[float] = []
-    early_flags: list[bool] = []
-    C_all: list[_np.ndarray] = []  # consumption series (NaN padded to T)
+    WT: List[float] = []
+    early_flags: List[bool] = []
+    C_all: List[_np.ndarray] = []  # consumption series (NaN padded to T)
 
     # hedge aggregates
     agg_hedge_hits = 0.0
@@ -282,20 +210,21 @@ def evaluate(
     agg_active_w_sum = 0.0
 
     seeds = getattr(cfg, "seeds", [0])
-    n_eval = int(getattr(cfg, "n_paths_eval", getattr(cfg, "rl_n_paths_eval", 1)))
+    # CLI와 호환: n_paths(일반) / rl_n_paths_eval(RL)
+    n_eval = int(getattr(cfg, "n_paths", getattr(cfg, "n_paths_eval", getattr(cfg, "rl_n_paths_eval", 1))))
 
     for sd in seeds:
         base = int(sd) * 100_000
         for k in range(n_eval):
             W_hist, C_hist, early, ep_stats = run_episode(env, actor, seed=base + k)
 
-            WT.append(W_hist[-1] if getattr(W_hist, "size", 0) > 0 else 0.0)
+            WT.append(W_hist[-1] if W_hist.size > 0 else 0.0)
             early_flags.append(bool(early))
 
             if T <= 0:
-                T = len(C_hist)
+                T = int(C_hist.size)
             row = _np.full(T, _np.nan, dtype=float)
-            take = min(len(C_hist), T)
+            take = min(C_hist.size, T)
             if take > 0:
                 row[:take] = C_hist[:take]
             C_all.append(row)
@@ -314,13 +243,15 @@ def evaluate(
         ruin_rate = 0.0
     else:
         ruin_rate = float(_np.mean(_np.logical_or(early_arr, WT_arr <= 0.0)))
-        if es_mode == "loss":
+        if str(es_mode).lower() == "loss":
             F = float(getattr(cfg, "F_target", 1.0) or 1.0)
-            m = metrics_loss(WT_arr, F=F, alpha=float(getattr(cfg, "alpha", 0.95)))
+            alpha = float(getattr(cfg, "alpha", 0.95))
+            m = metrics_loss(WT_arr, F=F, alpha=alpha)
             m["mean_WT"] = float(WT_arr.mean())
             m["es95_source"] = "computed_in_evaluate_loss"
         else:
-            m = metrics_wealth(WT_arr, alpha=float(getattr(cfg, "alpha", 0.95)))
+            alpha = float(getattr(cfg, "alpha", 0.95))
+            m = metrics_wealth(WT_arr, alpha=alpha)
             m["mean_WT"] = m["EW"]
             m["es95_source"] = "computed_in_evaluate_wealth"
     m["Ruin"] = ruin_rate
@@ -328,8 +259,8 @@ def evaluate(
 
     # hedge summary
     m["HedgeHit"] = float(agg_hedge_hits / agg_steps) if agg_steps > 0 else 0.0
-    m["HedgeKMean"] = float(agg_k_sum / agg_hedge_hits) if agg_hedge_hits > 0 else 0.0
-    m["HedgeActiveW"] = float(agg_active_w_sum / agg_hedge_hits) if agg_hedge_hits > 0 else 0.0
+    m["HedgeKMean"] = float(agg_k_sum / max(agg_hedge_hits, 1.0)) if agg_hedge_hits > 0 else 0.0
+    m["HedgeActiveW"] = float(agg_active_w_sum / max(agg_hedge_hits, 1.0)) if agg_hedge_hits > 0 else 0.0
 
     # -----------------------------
     # Consumption: bands + ES-like
@@ -486,7 +417,7 @@ def save_metrics_autocsv(metrics: dict, cfg: Any, outputs: Optional[str] = None)
         "horizon_years": getattr(cfg, "horizon_years", None),
         "steps_per_year": getattr(cfg, "steps_per_year", None),
         "seeds": seeds_str,
-        "n_paths_eval": getattr(cfg, "n_paths_eval", getattr(cfg, "rl_n_paths_eval", None)),
+        "n_paths_eval": getattr(cfg, "n_paths_eval", getattr(cfg, "rl_n_paths_eval", getattr(cfg, "n_paths", None))),
         "tag": getattr(cfg, "tag", None),
         # consumption
         "p10_c_last": metrics.get("p10_c_last"),

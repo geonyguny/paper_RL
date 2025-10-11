@@ -465,7 +465,6 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
              max_grad_norm=0.5, device=None) -> Dict[str, Any]:
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     gamma = gamma or getattr(cfg, "beta", 0.996)
-    random.seed(0); np.random.seed(0); torch.manual_seed(0)
 
     def _make_env_local():
         return _GymShim(RetirementEnv(cfg))
