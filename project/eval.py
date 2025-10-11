@@ -61,13 +61,45 @@ def _reset_env(env: RetirementEnv, seed: int) -> None:
                 pass
 
 
+def _as_nd_state(raw: Any, env_like: Any) -> _np.ndarray:
+    """
+    정책에 전달할 상태를 항상 ndarray([t_norm, W])로 정규화.
+    - dict: {"t": step_idx, "W": wealth} → [t_norm, W]
+    - ndarray: float ravel, 길이<2면 W 보강
+    - 기타: [0.0, env.W] 폴백
+    """
+    if isinstance(raw, dict):
+        T = int(getattr(env_like, "T", 1) or 1)
+        t_idx = float(raw.get("t", 0.0))
+        t_norm = t_idx / float(max(1, T - 1))
+        W_now = float(raw.get("W", getattr(env_like, "W", 0.0)))
+        return _np.asarray([t_norm, W_now], dtype=float)
+    if isinstance(raw, _np.ndarray):
+        arr = _np.asarray(raw, dtype=float).ravel()
+        if arr.size >= 2:
+            return arr[:2]
+        W_now = float(getattr(env_like, "W", 0.0))
+        return _np.asarray([float(arr[0]) if arr.size else 0.0, W_now], dtype=float)
+    return _np.asarray([0.0, float(getattr(env_like, "W", 0.0))], dtype=float)
+
+
+def _clean_finite(a: _np.ndarray) -> tuple[_np.ndarray, int, int]:
+    """
+    NaN/Inf 제거 유틸.
+    Returns: (finite_only, n_total, n_dropped)
+    """
+    arr = _np.asarray(a, dtype=float)
+    mask = _np.isfinite(arr)
+    return arr[mask], int(arr.size), int((~mask).sum())
+
+
 # =========================
 # Core episode
 # =========================
 
 def run_episode(
     env: RetirementEnv,
-    actor: Callable[[Dict[str, Any]], Tuple[float, float]],
+    actor: Callable[[Any], Tuple[float, float]],
     seed: int = 0,
 ) -> Tuple[_np.ndarray, _np.ndarray, bool, dict[str, float]]:
     """
@@ -90,11 +122,12 @@ def run_episode(
     hedge_active_w_sum = 0.0
 
     for _ in range(env.T):
-        state = env._obs()
+        raw_state = env._obs() if hasattr(env, "_obs") else {"t": 0.0, "W": getattr(env, "W", 0.0)}
+        state = _as_nd_state(raw_state, env)   # 상태 어댑터
         q, w = actor(state)
         _, _, done, _, info = env.step(q=q, w=w)
 
-        W_hist.append(env.W)
+        W_hist.append(float(env.W))
         C_hist.append(float((info or {}).get("consumption", 0.0)))
 
         # ruin (separate from death)
@@ -125,7 +158,7 @@ def run_episode(
 # =========================
 
 def metrics_wealth(WT_samples: _np.ndarray, alpha: float = 0.95) -> Dict[str, float]:
-    """ES95 = 하위 (1-α) 분위수 이하의 평균(부(-) 꼬리 평균 아님: 자산 관점)."""
+    """ES95 = 하위 (1-α) 분위수 이하의 평균(자산 관점)."""
     WT = _np.asarray(WT_samples, dtype=float)
     if WT.size == 0:
         return dict(EW=0.0, ES95=0.0)
@@ -143,7 +176,6 @@ def metrics_loss(WT_samples: _np.ndarray, F: float = 1.0, alpha: float = 0.95) -
         return dict(EW=0.0, EL=0.0, ES95=0.0)
     L = _np.maximum(F - WT, 0.0)
     EL = float(L.mean())
-    # 간단 표본식(CVaR): α-VaR 이상 꼬리의 평균
     qL = _np.quantile(L, alpha)      # VaR_α
     tail = L[L >= qL]
     ES = float(tail.mean()) if tail.size > 0 else float(qL)
@@ -209,16 +241,16 @@ def evaluate(
     agg_k_sum = 0.0
     agg_active_w_sum = 0.0
 
-    seeds = getattr(cfg, "seeds", [0])
+    seeds = getattr(cfg, "seeds", [0]) or [0]
     # CLI와 호환: n_paths(일반) / rl_n_paths_eval(RL)
-    n_eval = int(getattr(cfg, "n_paths", getattr(cfg, "n_paths_eval", getattr(cfg, "rl_n_paths_eval", 1))))
+    n_eval = int(getattr(cfg, "n_paths", getattr(cfg, "n_paths_eval", getattr(cfg, "rl_n_paths_eval", 1)) or 1))
 
     for sd in seeds:
         base = int(sd) * 100_000
         for k in range(n_eval):
             W_hist, C_hist, early, ep_stats = run_episode(env, actor, seed=base + k)
 
-            WT.append(W_hist[-1] if W_hist.size > 0 else 0.0)
+            WT.append(float(W_hist[-1]) if W_hist.size > 0 else 0.0)
             early_flags.append(bool(early))
 
             if T <= 0:
@@ -237,23 +269,36 @@ def evaluate(
     WT_arr = _np.asarray(WT, dtype=float)
     early_arr = _np.asarray(early_flags, dtype=bool)
 
-    # wealth/loss & ruin
-    if WT_arr.size == 0:
+    es_note_msgs: List[str] = []
+
+    # wealth/loss & ruin  (★ NaN/Inf 제거)
+    WT_fin, n_total, n_drop = _clean_finite(WT_arr)
+    if n_drop > 0:
+        es_note_msgs.append(f"dropped_nonfinite_WT={n_drop}/{n_total}")
+
+    # Ruin은 유한 샘플 기준으로 계산
+    if n_total == 0 or WT_fin.size == 0:
         m: Dict[str, float] = dict(EW=0.0, ES95=0.0, EL=0.0, mean_WT=0.0)
         ruin_rate = 0.0
+        es_note_msgs.append("no_finite_WT")
     else:
-        ruin_rate = float(_np.mean(_np.logical_or(early_arr, WT_arr <= 0.0)))
+        # early 플래그는 동일 길이이므로 유한 마스크로 필터
+        finite_mask = _np.isfinite(WT_arr)
+        early_fin = early_arr[finite_mask] if early_arr.size == finite_mask.size else early_arr
+        ruin_rate = float(_np.mean(_np.logical_or(early_fin, WT_fin <= 0.0))) if WT_fin.size > 0 else 0.0
+
         if str(es_mode).lower() == "loss":
-            F = float(getattr(cfg, "F_target", 1.0) or 1.0)
+            F = float(getattr(cfg, "F_target", 1.0))
             alpha = float(getattr(cfg, "alpha", 0.95))
-            m = metrics_loss(WT_arr, F=F, alpha=alpha)
-            m["mean_WT"] = float(WT_arr.mean())
+            m = metrics_loss(WT_fin, F=F, alpha=alpha)
+            m["mean_WT"] = float(WT_fin.mean()) if WT_fin.size > 0 else 0.0
             m["es95_source"] = "computed_in_evaluate_loss"
         else:
             alpha = float(getattr(cfg, "alpha", 0.95))
-            m = metrics_wealth(WT_arr, alpha=alpha)
+            m = metrics_wealth(WT_fin, alpha=alpha)
             m["mean_WT"] = m["EW"]
             m["es95_source"] = "computed_in_evaluate_wealth"
+
     m["Ruin"] = ruin_rate
     m["es_mode"] = str(es_mode).lower()
 
@@ -313,9 +358,13 @@ def evaluate(
         except Exception:
             pass
 
+    # ES 노트 정리
+    if es_note_msgs:
+        m["es95_note"] = "; ".join(es_note_msgs)
+
     if return_paths:
         extras: Dict[str, Any] = {
-            "eval_WT": WT_arr.tolist(),
+            "eval_WT": WT_arr.tolist(),  # 원본(필터 전) 유지: 재현/진단 목적
             "ruin_flags": early_flags,
             "T": int(T),
         }

@@ -4,7 +4,9 @@ from __future__ import annotations
 import contextlib
 import os
 import time
-from typing import Any, Dict, Optional, Callable, Tuple
+from typing import Any, Dict, Optional, Callable, Tuple, List, Union
+
+import numpy as _np
 
 from ..eval import evaluate
 from ..config import SimConfig
@@ -16,6 +18,10 @@ from .logging_filters import silence_stdio
 
 # market CSV loader
 from ..data.loader import load_market_csv
+
+# ⚠ HOTFIX 0-2: 로컬 롤아웃에서도 평가와 동일한 Env 사용(상태 스케일/필드 통일)
+# from ..env import RetirementEnv
+from ..env.retirement_env import RetirementEnv  # type: ignore
 
 
 # --------------------------
@@ -84,7 +90,7 @@ def _get_fx_hedge_params(args) -> Tuple[float, float]:
     try:
         fx_cost_annual = float(fx_cost_annual)
     except Exception:
-        fx_cost_annual = 0.002  # 0.2%p/년 (설계 문서 기본)
+        fx_cost_annual = 0.002  # 0.2%p/년
     return h, fx_cost_annual
 
 
@@ -131,15 +137,15 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
     )
 
     # ---- 개별 시계열 추출 ----
-    ret_kr = blob.get("ret_kr_eq")            # KR 주식 수익률(월)
-    ret_us_l = blob.get("ret_us_eq_krw")      # US 주식, KRW 기준(= FX 노출 포함)
-    ret_au = blob.get("ret_gold_krw")         # 금(KRW)
+    ret_kr = blob.get("ret_kr_eq")
+    ret_us_l = blob.get("ret_us_eq_krw")
+    ret_au = blob.get("ret_gold_krw")
     rf_real = blob.get("rf_real")
     rf_nom = blob.get("rf_nom")
     dates = blob.get("dates")
     cpi = blob.get("cpi")
 
-    # (가능 시) FX 월수익률: 로더가 제공하면 사용
+    # (가능 시) FX 월수익률
     ret_fx = blob.get("ret_fx") or blob.get("ret_fx_usdkrw") or None
 
     # ---- 환헤지 처리 (US) ----
@@ -149,10 +155,8 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
     fx_cost_m = float(fx_cost_ann) / float(steps_per_year)
 
     if ret_us_l is None:
-        # 로더에 종합 risky 수익률만 있는 레거시 케이스
         mixed = blob.get("ret_asset")
     else:
-        # US 현지자산 수익률을 근사: KRW기준 수익률에서 FX를 제거
         if ret_fx is not None:
             ret_us_hedged = (
                 np.asarray(ret_us_l, dtype=float)
@@ -160,16 +164,13 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
                 - h_fx * fx_cost_m
             )
         else:
-            # FX 시계열이 없으면 비용만 차감(보수적 보정)
             ret_us_hedged = np.asarray(ret_us_l, dtype=float) - h_fx * fx_cost_m
 
-        # ---- 믹스 가중합 ----
         a_kr, a_us, a_au = _parse_alpha_mix(args)
-        # None 안전 처리
         kr = np.asarray(ret_kr, dtype=float) if ret_kr is not None else 0.0
         us = np.asarray(ret_us_hedged, dtype=float)
         au = np.asarray(ret_au, dtype=float) if ret_au is not None else 0.0
-        # 브로드캐스트 대비, 모두 같은 길이 가정. 길이 불일치 시 가능한 최소 길이로 자름.
+
         lens = [x.shape[0] for x in [kr, us, au] if isinstance(x, np.ndarray)]
         T = min(lens) if len(lens) >= 1 else 0
         if isinstance(kr, np.ndarray):
@@ -180,31 +181,25 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
             au = au[:T]
         mixed = a_kr * kr + a_us * us + a_au * au
 
-        # cfg에 믹스/헤지 파라미터 기록(평가/로그용)
         setattr(cfg, "alpha_mix", (a_kr, a_us, a_au))
         setattr(cfg, "h_FX", h_fx)
         setattr(cfg, "fx_hedge_cost_annual", fx_cost_ann)
 
-    # Env에서 사용할 수 있도록 cfg에 부착
     setattr(cfg, "data_dates", dates)
     setattr(cfg, "data_cpi", cpi)
     setattr(cfg, "data_ret_series", mixed)
 
-    # 실질/명목 RF 선택 주입
     if getattr(args, "use_real_rf", "on") == "on":
         setattr(cfg, "data_rf_series", rf_real)
     else:
         setattr(cfg, "data_rf_series", rf_nom)
 
-    # 보조 시계열(선택적으로 활용)
     setattr(cfg, "data_ret_kr_eq", ret_kr)
     setattr(cfg, "data_ret_us_eq_krw", ret_us_l)
     setattr(cfg, "data_ret_gold_krw", ret_au)
 
-    # ---- 진단 로그 (quiet=off 일 때만) ----
     if str(getattr(args, "quiet", "on")).lower() != "on":
         try:
-            import numpy as _np
             ret_mean = float(_np.nanmean(mixed)) if mixed is not None else float("nan")
             rf_series = rf_real if getattr(args, "use_real_rf", "on") == "on" else rf_nom
             rf_mean = float(_np.nanmean(rf_series)) if rf_series is not None else float("nan")
@@ -220,16 +215,16 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
             pass
 
 
-def _to_actor(policy_like: Any) -> Callable[[Dict[str, Any]], tuple[float, float]]:
+def _to_actor(policy_like: Any) -> Callable[[Any], tuple[float, float]]:
     """
     다양한 형태의 policy/agent를 (q,w) 반환 actor(state)->(float,float) 로 래핑.
+    state는 dict/ndarray 모두 허용 (정책이 원하는 형태를 그대로 전달).
     """
     if policy_like is None:
         raise RuntimeError("policy_like is None")
 
-    def _actor(state: Dict[str, Any]):
+    def _actor(state: Any):
         out = None
-        # 우선 순위: act → __call__ → predict → callable
         if hasattr(policy_like, "act"):
             out = policy_like.act(state)
         elif callable(policy_like):
@@ -239,7 +234,6 @@ def _to_actor(policy_like: Any) -> Callable[[Dict[str, Any]], tuple[float, float
         else:
             raise RuntimeError("No callable interface for actor: need .act/.predict/callable")
 
-        # (q,w)로 정규화
         if isinstance(out, dict) and "q" in out and "w" in out:
             q, w = out["q"], out["w"]
         elif isinstance(out, (tuple, list)) and len(out) >= 2:
@@ -263,7 +257,6 @@ def _normalize_evaluate_output(ret, es_mode: str):
             metrics = ret[0]
         if len(ret) >= 2 and isinstance(ret[1], dict):
             extras = ret[1]
-        # 그 외 (길이>2, dict가 아닌 두 번째 요소 등)도 extras에 참고용으로 보관
         if len(ret) > 2:
             extras["_rest"] = ret[2:]
     else:
@@ -281,6 +274,69 @@ def _call_evaluate(cfg, actor, es_mode: str):
     except TypeError:
         ret = evaluate(cfg, actor, es_mode=str(es_mode).lower())
     return _normalize_evaluate_output(ret, es_mode)
+
+
+# ==========================
+# 안전한 경로 재평가(로컬 롤아웃)
+# ==========================
+def _as_ndarray_state(raw_obs: Union[Dict[str, Any], _np.ndarray, None], env: Any) -> _np.ndarray:
+    """
+    ⚠ HOTFIX 0-1: 정책에 전달할 상태를 항상 ndarray([t_norm, W]) 로 강제.
+    - dict: {"t": step_index, "W": wealth} 가정 → [t_norm, W]
+    - ndarray: 그대로 float 배열로 강제 캐스팅
+    - 기타: [0.0, env.W] 폴백
+    """
+    if isinstance(raw_obs, dict):
+        T = int(getattr(env, "T", 1) or 1)
+        t_idx = float(raw_obs.get("t", 0.0))
+        t_norm = t_idx / float(max(1, T - 1))
+        W_now = float(raw_obs.get("W", getattr(env, "W", 0.0)))
+        return _np.asarray([t_norm, W_now], dtype=float)
+    if isinstance(raw_obs, _np.ndarray):
+        arr = _np.asarray(raw_obs, dtype=float).ravel()
+        if arr.size >= 2:
+            return arr[:2]
+        # 관측이 1차원만 온다면 W는 env.W 로 보강
+        W_now = float(getattr(env, "W", 0.0))
+        return _np.asarray([float(arr[0]) if arr.size >= 1 else 0.0, W_now], dtype=float)
+    # 기타 폴백
+    return _np.asarray([0.0, float(getattr(env, "W", 0.0))], dtype=float)
+
+
+def _rollout_terminal_wealths(cfg: SimConfig,
+                              actor: Callable[[Any], tuple[float, float]],
+                              n_paths: int) -> List[float]:
+    """
+    evaluate가 경로를 안 주거나, 스칼라 복제 의심 시 방어적으로 직접 경로 샘플.
+    - 동일 Env 사용(상태 스케일/필드 동일)
+    - seed를 넘기지 않고 reset()만 반복 → 내부 path_counter/RNG로 경로 다양화
+    - 상태는 항상 ndarray([t_norm, W])로 정책에 전달
+    """
+    env = RetirementEnv(cfg)
+    WTs: List[float] = []
+    n_paths = int(max(1, n_paths))
+
+    for _ in range(n_paths):
+        env.reset()  # seed 인자 미전달 → 경로 다양화는 Env 내부에 위임
+        done = False
+        while not done:
+            raw = env._obs() if hasattr(env, "_obs") else None
+            state_nd = _as_ndarray_state(raw, env)
+            q, w = actor(state_nd)
+            _, _, done, _, _ = env.step(q, w)
+        WTs.append(float(getattr(env, "W", 0.0)))
+    return WTs
+
+
+def _looks_degenerate_wt(xs) -> bool:
+    """경로 배열이 없거나, 전부 동일/거의 동일하면 True."""
+    try:
+        arr = _np.asarray(xs, dtype=float).ravel()
+        if arr.size <= 1:
+            return True
+        return bool(_np.allclose(arr, arr[0], atol=0, rtol=0))
+    except Exception:
+        return True
 
 
 def run_once(args) -> Dict[str, Any]:
@@ -303,11 +359,9 @@ def run_once(args) -> Dict[str, Any]:
             setattr(cfg, "tag", args.tag)
 
         t1 = time.perf_counter()
-        # 실데이터 로더와 연결 (bootstrap일 때만)
         _wire_market_data(cfg, args)
         time_wire_data = time.perf_counter() - t1
 
-        # 연금 오버레이(필요 시 설정)
         t2 = time.perf_counter()
         ann_enabled = (
             str(getattr(args, "ann_on", "off")).lower() == "on"
@@ -317,7 +371,6 @@ def run_once(args) -> Dict[str, Any]:
             setup_annuity_overlay(cfg, args)
         time_annuity = time.perf_counter() - t2
 
-        # 정책 생성 → 평가
         t3 = time.perf_counter()
         actor = build_actor(cfg, args)
         time_build_actor = time.perf_counter() - t3
@@ -325,6 +378,24 @@ def run_once(args) -> Dict[str, Any]:
         t4 = time.perf_counter()
         m, extras = _call_evaluate(cfg, actor, es_mode=args.es_mode)
         time_eval = time.perf_counter() - t4
+
+    # ---- 방어적 후처리: eval_WT 보정 ----
+    extras = extras or {}
+    need_paths = (str(getattr(args, "print_mode", "full")).lower() == "full") and (not getattr(args, "no_paths", False))
+
+    wt_from_eval = extras.get("eval_WT", None)
+    if (not isinstance(wt_from_eval, (list, tuple))) or _looks_degenerate_wt(wt_from_eval):
+        if need_paths:
+            n_paths = getattr(args, "n_paths", None)
+            if n_paths is None or int(n_paths) <= 0:
+                n_paths = int(getattr(cfg, "n_paths_eval", 0)) or 100
+            try:
+                WTs = _rollout_terminal_wealths(cfg, _to_actor(actor), int(n_paths))
+                extras["eval_WT"] = [float(x) for x in WTs]
+                m.setdefault("mean_WT", float(_np.mean(WTs)))
+                m.setdefault("EW", float(_np.mean(WTs)))
+            except Exception as _e:
+                extras.setdefault("eval_WT_note", f"local rollout failed: {type(_e).__name__}")
 
     # --- 메트릭 병합: 연금 파생 파라미터는 항상 기록(미설정 시 0.0) ---
     if isinstance(m, dict):
@@ -334,19 +405,18 @@ def run_once(args) -> Dict[str, Any]:
         m.update(
             {
                 "y_ann": y_ann if (y_ann != 0.0) else 0.0,
-                "ann_a_factor": a_fac if (a_fac != 0.0) else 0.0,  # 편의상 유지
-                "a_factor": a_fac if (a_fac != 0.0) else 0.0,      # CSV에 쓰이는 필드
+                "ann_a_factor": a_fac if (a_fac != 0.0) else 0.0,
+                "a_factor": a_fac if (a_fac != 0.0) else 0.0,
                 "P": P_val if (P_val != 0.0) else 0.0,
             }
         )
 
-    # 총 평가 경로 수
-    n_paths_total = (
+    # 총 평가 경로 수(보고용)
+    n_paths_total = len(extras.get("eval_WT", [])) or (
         getattr(cfg, "n_paths_eval", getattr(cfg, "n_paths", 0))
         * len(getattr(cfg, "seeds", []))
     )
 
-    # 타이밍 집계
     time_total = time.perf_counter() - t_all_0
     timing = {
         "make_cfg_s": round(time_make_cfg, 6),
@@ -359,17 +429,17 @@ def run_once(args) -> Dict[str, Any]:
     }
 
     out = dict(
-        asset=cfg.asset,
+        asset=getattr(cfg, "asset", None),
         method=args.method,
-        baseline=args.baseline,
+        baseline=getattr(args, "baseline", ""),
         metrics=m,
-        w_max=cfg.w_max,
+        w_max=getattr(cfg, "w_max", None),
         fee_annual=getattr(cfg, "phi_adval", getattr(cfg, "fee_annual", None)),
-        lambda_term=cfg.lambda_term,
-        alpha=cfg.alpha,
-        F_target=cfg.F_target,
+        lambda_term=getattr(cfg, "lambda_term", None),
+        alpha=getattr(cfg, "alpha", None),
+        F_target=getattr(cfg, "F_target", None),
         es_mode=args.es_mode,
-        n_paths=n_paths_total,
+        n_paths=int(n_paths_total),
         args=slim_args(args),
         extra=extras,  # 경로 등 부가정보 (CSV에는 저장 안 함)
         timing=timing,
@@ -386,7 +456,7 @@ def run_once(args) -> Dict[str, Any]:
 def _maybe_load_actor_from_ckpt(
     ckpt_path: Optional[str],
     cfg_hint: Optional[Any],
-) -> Optional[Callable[[Dict[str, Any]], tuple[float, float]]]:
+) -> Optional[Callable[[Any], tuple[float, float]]]:
     """
     trainer가 actor/policy를 직접 안 주는 경우 ckpt에서 로딩 시도.
     우선 project/trainer/policy_io.load_policy_as_actor(ckpt, cfg_hint)를 시도하고
@@ -400,7 +470,7 @@ def _maybe_load_actor_from_ckpt(
         from ..trainer.policy_io import load_policy_as_actor  # type: ignore
         t0 = time.perf_counter()
         actor = load_policy_as_actor(ckpt_path, cfg_hint=cfg_hint)  # 새 시그니처
-        _ = time.perf_counter() - t0  # 로딩 시간은 run_rl의 timing에서 별도 측정
+        _ = time.perf_counter() - t0
         if callable(actor):
             return actor
     except Exception:
@@ -439,7 +509,6 @@ def run_rl(args):
 
     ensure_dir(args.outputs)
 
-    # tag → cfg 주입 (RL도 동일)
     if getattr(args, "tag", None) is not None:
         setattr(cfg, "tag", args.tag)
 
@@ -461,7 +530,6 @@ def run_rl(args):
     except Exception as e:
         raise SystemExit(f"RL trainer import failed: {e}")
 
-    # 학습 호출 자체의 벽시계 시간 래핑(트레이너가 별도로 제공하는 train_time_s와는 별개)
     t3 = time.perf_counter()
     fields: Dict[str, Any] = train_rl(
         cfg,
@@ -478,16 +546,14 @@ def run_rl(args):
     )
     time_train_call = time.perf_counter() - t3
 
-    # trainer가 선택적으로 반환할 수 있는 확장 필드들(없으면 None)
     best_epoch = fields.get("best_epoch")
-    ckpt_path = fields.get("ckpt_path")  # 예: outputs/<tag>/policy.pt
+    ckpt_path = fields.get("ckpt_path")
     train_time_s = fields.get("train_time_s")
     eval_time_s = fields.get("eval_time_s")
 
-    # --- actor 획득 시도: 반환 필드 → ckpt 로딩 → 실패 시 None ---
     policy_like = fields.get("actor") or fields.get("policy") or fields.get("pi") or fields.get("agent")
     t4 = time.perf_counter()
-    actor: Optional[Callable[[Dict[str, Any]], tuple[float, float]]] = None
+    actor: Optional[Callable[[Any], tuple[float, float]]] = None
     try:
         if policy_like is not None:
             actor = _to_actor(policy_like)
@@ -497,15 +563,11 @@ def run_rl(args):
         actor = _maybe_load_actor_from_ckpt(ckpt_path, cfg_hint=cfg)
     time_actor_load = time.perf_counter() - t4
 
-    # 총 평가 경로 수(= rl_n_paths_eval × seeds 수)
     n_paths_total = int(getattr(args, "rl_n_paths_eval", 0)) * len(getattr(args, "seeds", []))
 
-    # --- 옵션: actor를 그대로 반환해 CLI가 재평가 하도록 위임 (권장 경로) ---
     if actor is not None and str(getattr(args, "return_actor", "off")).lower() == "on":
-        # CLI 경로에서 총 시간은 CLI가 별도 계측
         return (cfg, actor)
 
-    # --- 폴백 경로: 여기서 바로 evaluate 수행 ---
     metrics_dict: Dict[str, Any]
     extras_dict: Dict[str, Any] = {}
 
@@ -513,7 +575,6 @@ def run_rl(args):
     if actor is not None:
         try:
             metrics_dict, extras_dict = _call_evaluate(cfg, actor, es_mode=getattr(args, "es_mode", "wealth"))
-            # 러닝 메타 부가
             metrics_dict.update(
                 {
                     "best_epoch": best_epoch,
@@ -521,10 +582,8 @@ def run_rl(args):
                     "eval_time_s": eval_time_s,
                 }
             )
-            # 소스 표기(wealth/loss는 evaluate가 이미 es95_source를 넣어줄 수 있음)
             metrics_dict.setdefault("es95_source", "computed_in_evaluate")
         except Exception as e:
-            # 평가 실패 시 trainer 메트릭으로 폴백
             metrics_dict = {
                 "EW": fields.get("EW"),
                 "ES95": fields.get("ES95"),
@@ -536,7 +595,6 @@ def run_rl(args):
                 "es95_note": f"evaluate failed in run_rl: {type(e).__name__}",
             }
     else:
-        # actor를 못 얻었다면 trainer가 준 요약 메트릭만 사용
         metrics_dict = {
             "EW": fields.get("EW"),
             "ES95": fields.get("ES95"),
@@ -549,13 +607,12 @@ def run_rl(args):
         }
     time_eval = time.perf_counter() - t5
 
-    # 타이밍 집계
     time_total = time.perf_counter() - t_all_0
     timing = {
         "make_cfg_s": round(time_make_cfg, 6),
         "wire_data_s": round(time_wire_data, 6),
         "annuity_setup_s": round(time_annuity, 6),
-        "train_call_s": round(time_train_call, 6),  # train_rl 호출 벽시계 시간
+        "train_call_s": round(time_train_call, 6),
         "actor_load_s": round(time_actor_load, 6),
         "evaluate_s": round(time_eval, 6),
         "total_s": round(time_total, 6),
@@ -563,20 +620,19 @@ def run_rl(args):
     }
 
     out = dict(
-        asset=cfg.asset,
+        asset=getattr(cfg, "asset", None),
         method="rl",
         baseline="",
         metrics=metrics_dict,
-        w_max=cfg.w_max,
+        w_max=getattr(cfg, "w_max", None),
         fee_annual=getattr(cfg, "phi_adval", getattr(cfg, "fee_annual", None)),
-        lambda_term=cfg.lambda_term,
-        alpha=cfg.alpha,
-        F_target=cfg.F_target,
+        lambda_term=getattr(cfg, "lambda_term", None),
+        alpha=getattr(cfg, "alpha", None),
+        F_target=getattr(cfg, "F_target", None),
         es_mode=getattr(args, "es_mode", "wealth"),
         n_paths=n_paths_total,
         args=slim_args(args)
         | {
-            # 결과 재현을 위해 args에도 몇 가지 핵심 하이퍼 명시
             "rl_q_cap": getattr(args, "rl_q_cap", None),
             "teacher_eps0": getattr(args, "teacher_eps0", None),
             "teacher_decay": getattr(args, "teacher_decay", None),
@@ -594,7 +650,6 @@ def run_rl(args):
         time_total_hms=timing["total_hms"],
     )
 
-    # RL도 autosave 동일 적용
     if getattr(args, "autosave", "off") == "on":
         do_autosave(out.get("metrics") or {}, cfg, args, out)
 

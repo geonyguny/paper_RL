@@ -1,3 +1,4 @@
+# project/runner/cli.py
 from __future__ import annotations
 
 import argparse
@@ -6,7 +7,7 @@ import os
 import re
 import time
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from ..config import (
     CVAR_TARGET_DEFAULT,
@@ -25,7 +26,30 @@ from .eta_utils import (
 from .cvar_utils import fixup_metrics_with_cvar
 from .pack_utils import prune_for_stdout, maybe_evaluate_with_es_mode
 
-_WINDOW_RE = re.compile(r"^\d{4}-\d{2}:\d{4}-\d{2}$")
+# YYYY-MM:YYYY-MM, YYYY-MM:, :YYYY-MM 모두 허용
+_WINDOW_RE = re.compile(r"^(?:\d{4}-\d{2})?:(?:\d{4}-\d{2})?$")
+
+
+# --- helpers ---------------------------------------------------------------
+
+def _csv_floats(s: str | None) -> List[float] | None:
+    """
+    "0.10,0.20,0.30" -> [0.1, 0.2, 0.3]
+    공백/빈문자/None이면 None 반환.
+    """
+    if s is None:
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+    out: List[float] = []
+    for tok in s.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        out.append(float(tok))
+    return out if out else None
+
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
@@ -36,6 +60,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--baseline", type=str, default=None)
     p.add_argument("--w_max", type=float, default=0.70)
     p.add_argument("--fee_annual", type=float, default=0.004)
+    p.add_argument("--phi_adval", type=float, default=None, help="(선택) fee_annual 대신 선취 ad-valorem 수수료")
     p.add_argument("--horizon_years", type=int, default=35)
     p.add_argument("--alpha", type=float, default=0.95)
     p.add_argument("--lambda_term", type=float, default=0.0)
@@ -54,6 +79,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--hjb_W_grid", type=int, default=None)
     p.add_argument("--hjb_Nshock", type=int, default=None)
     p.add_argument("--hjb_eta_n", type=int, default=None)
+    # (NEW) w-grid / dev w-floor
+    p.add_argument("--hjb_w_grid", type=str, default=None,
+                   help="Comma-separated w grid for HJB (e.g. '0.10,0.20,0.30,0.40,0.50').")
+    p.add_argument("--w_min_dev", type=float, default=None,
+                   help="(dev) Minimum risky weight; drop w < w_min_dev from HJB action set.")
 
     # Hedge (legacy)
     p.add_argument("--hedge", choices=["on", "off"], default="off")
@@ -169,6 +199,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     return p
 
+
 def _apply_data_profile_defaults(args) -> None:
     if getattr(args, "data_profile", None) and not getattr(args, "market_csv", None):
         base = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "data", "market"))
@@ -177,14 +208,18 @@ def _apply_data_profile_defaults(args) -> None:
         elif args.data_profile == "full":
             args.market_csv = os.path.abspath(os.path.join(base, "kr_us_gold_bootstrap_full.csv"))
 
+
 def _validate_args(args) -> None:
     if args.data_window is not None:
         s = str(args.data_window).strip()
         if s and not _WINDOW_RE.match(s):
-            raise SystemExit(f"--data_window 형식 오류: '{args.data_window}'. 예: 2005-01:2020-12")
+            raise SystemExit(f"--data_window 형식 오류: '{args.data_window}'. 예: 2005-01:2020-12 또는 '2005-01:' / ':2020-12'")
     if args.method in ("hjb", "rule", "rl") and args.market_mode == "bootstrap":
         if not args.market_csv and not args.data_profile:
             raise SystemExit("market_mode=bootstrap 사용 시 --market_csv 또는 --data_profile(dev|full) 필요.")
+    if args.method == "rule" and not args.baseline:
+        raise SystemExit("method=rule 사용 시 --baseline (4pct|cpb|vpw|kgr) 필수.")
+
 
 def main():
     t0 = time.perf_counter()
@@ -192,12 +227,18 @@ def main():
     p = _build_arg_parser()
     args = p.parse_args()
 
+    # --- parse/normalize new options early ---
+    # 문자열로 온 --hjb_w_grid을 리스트[float]로 변환해서 downstream으로 전달
+    parsed_w_grid = _csv_floats(getattr(args, "hjb_w_grid", None))
+    if parsed_w_grid is not None:
+        args.hjb_w_grid = parsed_w_grid  # 타입을 리스트로 고정
+
     _apply_data_profile_defaults(args)
     _validate_args(args)
 
     # === ETA: 실행 전 예측 & 예산 검사 ===
     try:
-        if getattr(args, "eta_mode", "history") == "history":
+        if str(getattr(args, "eta_mode", "history")).lower() == "history":
             db = eta_load_db(eta_db_path(args))
             eta_s, src = predict_eta_from_history(args, db)
             if eta_s is not None:
@@ -219,7 +260,7 @@ def main():
     want_paths = (str(getattr(args, "print_mode", "full")).lower() == "full") and (not getattr(args, "no_paths", False))
 
     # === 라우팅 ===
-    if getattr(args, "calib", "off") == "on":
+    if str(getattr(args, "calib", "off")).lower() == "on":
         out = calibrate_lambda(args)
         if isinstance(out, dict) and "es_mode" not in out:
             out["es_mode"] = str(getattr(args, "es_mode", "wealth")).lower()
@@ -273,6 +314,7 @@ def main():
     # 출력
     to_print = prune_for_stdout(args, out) if isinstance(out, dict) else out
     print(json.dumps(to_print, ensure_ascii=False))
+
 
 if __name__ == "__main__":
     main()

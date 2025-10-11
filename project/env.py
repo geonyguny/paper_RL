@@ -2,12 +2,48 @@
 from __future__ import annotations
 
 import numpy as _np
-from numpy.random import Generator as _Generator, default_rng as _default_rng, SeedSequence as _SeedSequence
+from numpy.random import Generator as _Generator, default_rng as _np_default_rng, SeedSequence as _SeedSequence
 from typing import Optional, Tuple, Dict, Any
 
 from .config import SimConfig
 from .market import IIDNormalMarket, BootstrapMarket
 from .mortality import MortalitySampler
+
+
+# ============================================================
+# RNG utilities: Global SeedSequence master + factory helpers
+# ============================================================
+_SS_MASTER: Optional[_SeedSequence] = None
+_SS_COUNTER: int = 0  # 재현 가능한 호출 카운터
+
+def _init_ss_master(seed_like: Optional[int]) -> None:
+    """최초 1회만 전역 SeedSequence를 초기화. seed_like=None이면 OS 엔트로피."""
+    global _SS_MASTER
+    if _SS_MASTER is None:
+        _SS_MASTER = _SeedSequence(int(seed_like)) if seed_like is not None else _SeedSequence()
+
+def _next_child_ss() -> _SeedSequence:
+    """전역 마스터에서 자식 SeedSequence 하나를 뽑아온다(호출마다 상이)."""
+    global _SS_MASTER, _SS_COUNTER
+    if _SS_MASTER is None:
+        _init_ss_master(None)
+    _SS_COUNTER += 1
+    # master entropy + counter를 섞어서 child 시퀀스 생성
+    return _SeedSequence(entropy=(_SS_MASTER.entropy, _SS_COUNTER))  # type: ignore[arg-type]
+
+def _default_rng(seed_like: Optional[object] = None) -> _Generator:
+    """
+    통일 RNG 팩토리:
+    - seed_like is None           → 전역 마스터에서 child 시퀀스로 RNG
+    - seed_like is int            → 그 정수 시드로 고정 RNG
+    - seed_like is SeedSequence   → 그 SS에서 child를 spawn하여 RNG
+    """
+    if seed_like is None:
+        return _np_default_rng(_next_child_ss())
+    if isinstance(seed_like, _SeedSequence):
+        return _np_default_rng(seed_like.spawn(1)[0])
+    # 정수/정수형태 문자열 등
+    return _np_default_rng(int(seed_like))
 
 
 class RetirementEnv:
@@ -42,32 +78,24 @@ class RetirementEnv:
 
         # ----- RNG 배선: base_seed → [env, market] 서브스트림 분리 -----
         base_seed = getattr(cfg, "seed", None)
-        self._rng: _Generator
-        self._rng_market: Optional[_Generator]
-
         if rng is not None or market_rng is not None:
-            # 외부에서 직접 주입 시 그대로 사용
+            # 외부에서 직접 주입 시 그대로 사용(없으면 전역 child)
             self._rng = rng or _default_rng()
-            self._rng_market = market_rng
+            self._rng_market = market_rng or _default_rng()
         else:
-            # cfg.seed가 있으면 재현 가능하게, 없으면 비결정적
-            if base_seed is not None:
-                ss = _SeedSequence(int(base_seed))
-                env_ss, mkt_ss = ss.spawn(2)
-                self._rng = _default_rng(env_ss)
-                self._rng_market = _default_rng(mkt_ss)
-            else:
-                self._rng = _default_rng()
-                self._rng_market = None
+            # cfg.seed가 있으면 그 값으로 master 초기화 → child 2개 생성
+            _init_ss_master(base_seed)
+            self._rng = _np_default_rng(_next_child_ss())
+            self._rng_market = _np_default_rng(_next_child_ss())
 
         # Market backend (iid / bootstrap)
         mode = str(getattr(cfg, "market_mode", "iid")).lower()
         if mode == "bootstrap":
-            self.market = BootstrapMarket(cfg)  # 시장 쪽에 rng 주입 시도는 아래에서 처리
+            self.market = BootstrapMarket(cfg)  # 시장 쪽에 rng 주입은 아래에서 시도
         else:
             self.market = IIDNormalMarket(cfg)
 
-        # 가능하면 market에 RNG 주입(라이브러리 호환성 고려)
+        # 가능하면 market에 RNG 주입(호환성 고려)
         self._try_wire_market_rng(self._rng_market)
 
         # Hedge params (monthly)
@@ -133,10 +161,9 @@ class RetirementEnv:
                 return
             except Exception:
                 pass
-        # 마지막 수단: seed 메서드가 있으면 엔트로피 추출해 정수 seed로 설정
+        # 마지막 수단: seed 메서드가 있으면 임의 정수로 설정
         if hasattr(self.market, "seed"):
             try:
-                # Generator는 .bit_generator.state['state'] 가 있으나 구현 의존적 → 간단히 정수 추출
                 tmp = _default_rng().integers(0, 2**31 - 1, dtype=_np.int64)
                 self.market.seed(int(tmp))
             except Exception:
@@ -144,14 +171,10 @@ class RetirementEnv:
 
     def reseed(self, base_seed: Optional[int]) -> None:
         """런 타임에 base_seed로 env/market RNG를 재구성."""
-        if base_seed is None:
-            self._rng = _default_rng()
-            self._rng_market = None
-        else:
-            ss = _SeedSequence(int(base_seed))
-            env_ss, mkt_ss = ss.spawn(2)
-            self._rng = _default_rng(env_ss)
-            self._rng_market = _default_rng(mkt_ss)
+        # master를 base_seed로(또는 OS 엔트로피로) 초기화하고 child 2개 뽑음
+        _init_ss_master(base_seed)
+        self._rng = _np_default_rng(_next_child_ss())
+        self._rng_market = _np_default_rng(_next_child_ss())
         self._try_wire_market_rng(self._rng_market)
 
     # --------------------
@@ -189,7 +212,7 @@ class RetirementEnv:
     # API
     # --------------------
     def reset(self, seed: Optional[int] = None, W0: float = 1.0) -> Dict[str, Any]:
-        # reseed (internal RNG + backend)
+        # reseed (internal RNG + backend) – seed가 주어지면 그걸로 child 재구성
         if seed is not None:
             self.reseed(int(seed))
 
